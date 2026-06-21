@@ -1,21 +1,26 @@
 """
-CACD Stage 2d — Calibration: raw cross-encoder logit → calibrated
-probability P(duplicate | attention_pattern).
+CACD Stage 2d — Calibration: redundancy signal (từ attention coverage)
+→ calibrated probability P(duplicate | attention_pattern).
 
-Vì model cross-encoder dùng pretrained (ms-marco-MiniLM-L-6-v2) và
-KHÔNG fine-tune cho bài toán dedup cụ thể (quyết định của user), raw
-logit của nó không tự động là một xác suất hợp lệ — nó được train
-cho mục đích relevance ranking (MS MARCO passage ranking), không
-phải binary duplicate classification.
+QUAN TRỌNG — lý do KHÔNG dùng raw_logit của cross-encoder trực tiếp:
+ms-marco-MiniLM-L-6-v2 được train cho RELEVANCE RANKING (MS MARCO
+passage ranking) — raw_logit cao nghĩa là "passage B liên quan tới
+query A", KHÔNG phải "A và B là bản sao của nhau". Hai chunk thuộc
+cùng một chủ đề (rất phổ biến trong cùng 1 document SQuAD) có thể có
+raw_logit rất cao dù nội dung hoàn toàn khác nhau. Dùng raw_logit trực
+tiếp làm tín hiệu dedup đã được quan sát thực nghiệm gây ra over-drop
+nghiêm trọng (77-90% chunk bị drop oan trên debug run đầu tiên).
 
-Để vẫn giữ đúng tinh thần "threshold-free / calibrated probability"
-(Section 2.4 trong báo cáo novel idea) mà không cần fine-tune, ta
-dùng temperature scaling KHÔNG-THAM-SỐ-HỌC: nhiệt độ T được ước
-lượng từ chính phân phối raw_logit quan sát được trên dữ liệu đang
-chạy (không cần nhãn duplicate/not-duplicate có sẵn), theo nguyên
-tắc Platt-scaling đơn giản hóa — chuẩn hóa logit về phân phối có
-ý nghĩa xác suất thông qua sigmoid, với T = độ lệch chuẩn của batch
-logit hiện tại.
+Tín hiệu đúng bản chất hơn — được tính trong stage3_decision.py từ
+chính attention matrix (Stage 2b/2c, không cần thêm model khác):
+    redundancy_signal = min(coverage_a_to_b, coverage_b_to_a)
+Một cặp chỉ thực sự "trùng lặp" khi CẢ HAI chiều đều bao phủ nhau cao.
+
+Calibrator ở đây biến redundancy_signal thô (thường nằm trong khoảng
+nhỏ, 0.0-0.3 trên dữ liệu thực tế) thành một xác suất có ý nghĩa
+TƯƠNG ĐỐI trong chính phân phối dữ liệu đang chạy, qua z-score +
+sigmoid — không cần nhãn duplicate/not-duplicate có sẵn (online,
+không-tham-số-học).
 
 Đây KHÔNG phải calibration đã được chứng minh chính xác tuyệt đối
 (cần dữ liệu có nhãn để calibrate chuẩn — xem Desai & Durrett, EMNLP
@@ -36,47 +41,50 @@ logger = logging.getLogger(__name__)
 
 class RunningLogitCalibrator:
     """
-    Calibrator chạy động (online), tự cập nhật theo phân phối raw_logit
-    quan sát được qua quá trình ingest, dùng z-score + sigmoid để biến
-    raw logit thành xác suất P(duplicate) có ý nghĩa tương đối trong
-    chính phân phối dữ liệu hiện tại.
+    Calibrator chạy động (online), tự cập nhật theo phân phối của tín
+    hiệu redundancy quan sát được qua quá trình ingest, dùng z-score +
+    sigmoid để biến tín hiệu thô thành xác suất P(duplicate) có ý nghĩa
+    tương đối trong chính phân phối dữ liệu hiện tại.
 
-    Đây thay thế cho threshold cố định: thay vì so logit với 1 hằng số
-    tuyệt đối, ta so nó với PHÂN PHỐI logit đã quan sát được — một
-    cặp được coi là "khả nghi cao" nếu logit của nó nằm ở phần đuôi
-    cao của phân phối, bất kể domain/document cụ thể có shift thang
-    đo logit thế nào.
+    Input là `redundancy_signal = min(coverage_a_to_b, coverage_b_to_a)`
+    (xem stage3_decision.py) — KHÔNG phải raw_logit của cross-encoder.
+
+    Đây thay thế cho threshold cố định: thay vì so tín hiệu với 1 hằng
+    số tuyệt đối, ta so nó với PHÂN PHỐI tín hiệu đã quan sát được —
+    một cặp được coi là "khả nghi cao" nếu redundancy_signal của nó nằm
+    ở phần đuôi cao của phân phối, bất kể domain/document cụ thể có
+    shift thang đo thế nào.
     """
 
     def __init__(self, min_samples: int = 30):
         self.min_samples = min_samples
-        self._logits: list[float] = []
+        self._signals: list[float] = []
 
-    def update(self, raw_logit: float) -> None:
-        self._logits.append(raw_logit)
+    def update(self, signal: float) -> None:
+        self._signals.append(signal)
 
-    def calibrated_probability(self, raw_logit: float) -> float:
+    def calibrated_probability(self, signal: float) -> float:
         """
-        P(duplicate) = sigmoid( z-score(raw_logit) )
+        P(duplicate) = sigmoid( z-score(signal) )
 
-        Nếu chưa đủ mẫu để ước lượng phân phối ổn định, fallback về
-        sigmoid thô trên raw_logit (vẫn tốt hơn so sánh trực tiếp
-        với 1 threshold tùy tiện, vì sigmoid bị chặn trong [0,1] và
-        có diễn giải xác suất).
+        Khi chưa có đủ dữ liệu để ước lượng phân phối (< 2 mẫu), trả
+        về 0.0 — trung lập, nghiêng về phía "giữ lại" (an toàn hơn so
+        với drop nhầm 1 chunk khi chưa biết gì về phân phối dữ liệu
+        đang xử lý).
         """
-        if len(self._logits) < self.min_samples:
-            return float(1.0 / (1.0 + np.exp(-raw_logit)))
+        if len(self._signals) < 2:
+            return 0.0
 
-        arr = np.array(self._logits)
+        arr = np.array(self._signals)
         mean = arr.mean()
         std = arr.std() + 1e-6
-        z = (raw_logit - mean) / std
+        z = (signal - mean) / std
         return float(1.0 / (1.0 + np.exp(-z)))
 
     def stats(self) -> dict:
-        if not self._logits:
+        if not self._signals:
             return {"n": 0, "mean": 0.0, "std": 0.0}
-        arr = np.array(self._logits)
+        arr = np.array(self._signals)
         return {
             "n":    len(arr),
             "mean": round(float(arr.mean()), 4),

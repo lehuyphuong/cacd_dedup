@@ -153,11 +153,26 @@ def run_cacd_dedup(
         # Stage 2 — cross-attention scoring cho từng candidate
         scored = score_candidates(chunk["text"], candidates)
 
-        # Calibrate raw_logit → P(duplicate), cập nhật phân phối động
+        # ── Tín hiệu redundancy đúng bản chất ───────────────────────────
+        # raw_logit của ms-marco-MiniLM-L-6-v2 là RELEVANCE score (passage
+        # B có liên quan tới query A không), KHÔNG phải DUPLICATE score.
+        # Hai chunk cùng chủ đề (rất phổ biến trong 1 document SQuAD) có
+        # thể có raw_logit rất cao dù nội dung hoàn toàn khác nhau — dùng
+        # trực tiếp raw_logit làm tín hiệu dedup sẽ drop oan hàng loạt.
+        #
+        # Tín hiệu đúng hơn: redundancy_signal = min(coverage_a_to_b,
+        # coverage_b_to_a) — một cặp chỉ thực sự "trùng lặp" khi CẢ HAI
+        # chiều đều có độ bao phủ cao (A được B bao phủ nhiều VÀ B được A
+        # bao phủ nhiều). Dùng min (không phải mean) để tránh trường hợp
+        # 1 chiều bao phủ cao (B chứa trọn A, A là tập con của B) trong
+        # khi chiều kia thấp bị tính nhầm thành "trùng lặp đối xứng".
         for s in scored:
-            calibrator.update(s["raw_logit"])
+            s["redundancy_signal"] = min(s["coverage_a_to_b"], s["coverage_b_to_a"])
+            calibrator.update(s["redundancy_signal"])
         for s in scored:
-            s["p_duplicate"] = round(calibrator.calibrated_probability(s["raw_logit"]), 4)
+            s["p_duplicate"] = round(
+                calibrator.calibrated_probability(s["redundancy_signal"]), 4
+            )
 
         best = max(scored, key=lambda s: s["p_duplicate"])
 
@@ -182,6 +197,7 @@ def run_cacd_dedup(
             "best_candidate_id":  best["chunk_id"],
             "coverage_a_to_b":    best["coverage_a_to_b"],
             "coverage_b_to_a":    best["coverage_b_to_a"],
+            "redundancy_signal":  best["redundancy_signal"],
             "attn_entropy":       best["attn_entropy"],
             "cutoff_used":        round(CUTOFF, 4),
         })

@@ -2,7 +2,7 @@
 
 **Cross-Attention Calibrated Deduplication (CACD)** — một phương pháp chunk-filtering mới cho RAG, thay thế cosine-similarity threshold cố định bằng cross-encoder + calibrated probability.
 
-Giữ nguyên 5 chunking strategies để đánh giá, va **một pipeline duy nhất: CACD**.
+Project độc lập, tách riêng khỏi `rag-bench-v4`. Giữ nguyên 5 chunking strategies để đánh giá, nhưng thay toàn bộ 5 filter methods cũ (NoFilter / ExactNorm / MinHashLSH / Similarity / NERExact) bằng **một pipeline duy nhất: CACD**.
 
 ---
 
