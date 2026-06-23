@@ -52,9 +52,9 @@ CACD_TOP_K_CANDIDATES = 5   # K ứng viên gần nhất lấy ra từ HNSW mỗ
 
 # ── CACD — Stage 2 (Cross-attention) ─────────────────────────────────────────
 # Pretrained, KHÔNG fine-tune (theo quyết định của user). Model được chọn
-# dựa trên kết quả research: cross-encoder/ms-marco-MiniLM-L-6-v2 là
+# dựa trên kết quả research: cross-encoder/msmarco-MiniLM-L6-en-de-v1 là
 # baseline phổ biến nhất trong literature (AugSBERT, nhiều paper rerank).
-CACD_CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+CACD_CROSS_ENCODER_MODEL = "cross-encoder/msmarco-MiniLM-L6-en-de-v1"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
