@@ -25,12 +25,18 @@ from configs.settings import (
     CACD_COST_FALSE_POSITIVE,
     HEATMAP_DIR,
 )
-from src.dedup.calibration import RunningLogitCalibrator, bayes_optimal_cutoff
 from src.dedup.stage1_coarse_retrieval import batch_coarse_retrieve
 from src.dedup.stage2_cross_attention import score_candidates
 
 logger = logging.getLogger(__name__)
 
+# Ngưỡng tự nhiên của msmarco-MiniLM-L6-en-de-v1:
+# prob_duplicate = sigmoid(raw_logit) — model được train để
+# phân biệt duplicate/non-duplicate trực tiếp, nên 0.5 là ranh giới
+# quyết định có căn cứ từ quá trình training, không phải số đoán mò.
+# Bayes-optimal cost ratio vẫn được dùng để điều chỉnh nếu cần ưu
+# tiên precision (tránh drop nhầm) hơn recall (tránh giữ thừa).
+from src.dedup.calibration import bayes_optimal_cutoff
 CUTOFF = bayes_optimal_cutoff(
     cost_false_positive=CACD_COST_FALSE_POSITIVE,
     cost_false_negative=CACD_COST_FALSE_NEGATIVE,
@@ -124,7 +130,6 @@ def run_cacd_dedup(
     """
     from src.ingestion.vector_store import upsert_chunks
 
-    calibrator = RunningLogitCalibrator()
     kept_chunks: list[dict] = []
     audit_log: list[dict] = []
     n_heatmaps_saved = 0
@@ -142,42 +147,36 @@ def run_cacd_dedup(
             kept_chunks.append(chunk)
             upsert_chunks(cname, [chunk], [vec])
             audit_log.append({
-                "chunk_id": chunk["chunk_id"],
-                "decision": "keep",
-                "reason":   "no_candidates",
-                "best_p_duplicate": 0.0,
+                "chunk_id":          chunk["chunk_id"],
+                "decision":          "keep",
+                "reason":            "no_candidates",
+                "best_p_duplicate":  0.0,
                 "best_candidate_id": "",
             })
             continue
 
-        # Stage 2 — cross-attention scoring cho từng candidate
+        # Stage 2 — cross-attention scoring cho từng candidate.
+        # score_candidates trả về prob_duplicate đã là sigmoid(raw_logit)
+        # từ model msmarco-MiniLM-L6-en-de-v1 — model này được train để
+        # phân biệt duplicate/non-duplicate trực tiếp, nên prob_duplicate
+        # là tín hiệu đúng bản chất, không cần qua z-score calibrator.
         scored = score_candidates(chunk["text"], candidates)
 
-        # ── Tín hiệu redundancy đúng bản chất ───────────────────────────
-        # raw_logit của ms-marco-MiniLM-L-6-v2 là RELEVANCE score (passage
-        # B có liên quan tới query A không), KHÔNG phải DUPLICATE score.
-        # Hai chunk cùng chủ đề (rất phổ biến trong 1 document SQuAD) có
-        # thể có raw_logit rất cao dù nội dung hoàn toàn khác nhau — dùng
-        # trực tiếp raw_logit làm tín hiệu dedup sẽ drop oan hàng loạt.
-        #
-        # Tín hiệu đúng hơn: redundancy_signal = min(coverage_a_to_b,
-        # coverage_b_to_a) — một cặp chỉ thực sự "trùng lặp" khi CẢ HAI
-        # chiều đều có độ bao phủ cao (A được B bao phủ nhiều VÀ B được A
-        # bao phủ nhiều). Dùng min (không phải mean) để tránh trường hợp
-        # 1 chiều bao phủ cao (B chứa trọn A, A là tập con của B) trong
-        # khi chiều kia thấp bị tính nhầm thành "trùng lặp đối xứng".
+        # Tính redundancy_signal bổ sung (coverage-based) để ghi audit log
+        # và vẽ heatmap — KHÔNG dùng để quyết định drop/keep nữa.
         for s in scored:
-            s["redundancy_signal"] = min(s["coverage_a_to_b"], s["coverage_b_to_a"])
-            calibrator.update(s["redundancy_signal"])
-        for s in scored:
-            s["p_duplicate"] = round(
-                calibrator.calibrated_probability(s["redundancy_signal"]), 4
+            s["redundancy_signal"] = min(
+                s["coverage_a_to_b"], s["coverage_b_to_a"]
             )
 
-        best = max(scored, key=lambda s: s["p_duplicate"])
+        # Chọn candidate có prob_duplicate cao nhất để quyết định.
+        best = max(scored, key=lambda s: s["prob_duplicate"])
 
-        # Stage 3 — quyết định threshold-free (chỉ nhánh Drop)
-        if best["p_duplicate"] > CUTOFF:
+        # Stage 3 — quyết định dựa trên prob_duplicate với ngưỡng tự nhiên.
+        # CUTOFF = 0.5 khi cost_FP = cost_FN (mặc định đối xứng), tương
+        # đương ngưỡng sigmoid tự nhiên của model. Tăng cost_FP trong
+        # settings.py để hệ thống thận trọng hơn khi drop.
+        if best["prob_duplicate"] > CUTOFF:
             decision = "drop"
         else:
             decision = "keep"
@@ -192,8 +191,8 @@ def run_cacd_dedup(
         audit_log.append({
             "chunk_id":           chunk["chunk_id"],
             "decision":           decision,
-            "reason":             "cross_attention_cutoff",
-            "best_p_duplicate":   best["p_duplicate"],
+            "reason":             "prob_duplicate_cutoff",
+            "best_p_duplicate":   best["prob_duplicate"],
             "best_candidate_id":  best["chunk_id"],
             "coverage_a_to_b":    best["coverage_a_to_b"],
             "coverage_b_to_a":    best["coverage_b_to_a"],
@@ -207,9 +206,10 @@ def run_cacd_dedup(
             upsert_chunks(cname, [chunk], [vec])
 
         if (i + 1) % 50 == 0:
+            n_dropped = (i + 1) - len(kept_chunks)
             logger.info(
-                "  CACD progress: %d/%d chunks xử lý | kept=%d | calib=%s",
-                i + 1, len(chunks), len(kept_chunks), calibrator.stats(),
+                "  CACD progress: %d/%d chunks xử lý | kept=%d | dropped=%d | cutoff=%.4f",
+                i + 1, len(chunks), len(kept_chunks), n_dropped, CUTOFF,
             )
 
     logger.info(

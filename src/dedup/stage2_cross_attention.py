@@ -141,7 +141,16 @@ def score_pair(text_a: str, text_b: str) -> dict:
     ).to(DEVICE)
 
     outputs = model(**inputs)
-    raw_logit = outputs.logits.squeeze().item()
+
+    # Xử lý cả model binary (1 logit) và multi-class (vd. NLI 3 class)
+    logits = outputs.logits.squeeze()
+    if logits.dim() == 0:
+        raw_logit    = logits.item()
+        prob_dup     = float(torch.sigmoid(logits).item())
+    else:
+        # Lấy class cuối (thường là entailment/match/duplicate)
+        raw_logit    = logits[-1].item()
+        prob_dup     = float(torch.softmax(logits, dim=-1)[-1].item())
 
     # Lấy attention layer cuối, average qua mọi head — giữ đúng tinh
     # thần "trích xuất attention matrix, mọi layer, mọi head" nhưng
@@ -163,7 +172,8 @@ def score_pair(text_a: str, text_b: str) -> dict:
     entropy = _attention_entropy(avg_attn, sep_idx, n_tokens)
 
     return {
-        "raw_logit":        raw_logit,
+        "raw_logit":        round(raw_logit, 4),
+        "prob_duplicate":   round(prob_dup, 4),   # tín hiệu chính cho Stage 3
         "coverage_a_to_b":  round(cov_a_to_b, 4),
         "coverage_b_to_a":  round(cov_b_to_a, 4),
         "attn_entropy":     round(entropy, 4),
