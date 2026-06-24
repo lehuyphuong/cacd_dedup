@@ -41,7 +41,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from configs.settings import CHUNKING_CONFIGS, EMBED_BATCH_SIZE, RESULTS_DIR, TOP_K
-from src.dedup.stage3_decision import CUTOFF, run_cacd_dedup
+from src.dedup.stage3_decision import PROB_HIGH, PROB_LOW, NIS_DROP_THRESHOLD, run_cacd_dedup
 from src.evaluation.metrics import compute_retrieval_metrics
 from src.ingestion.chunker import chunk_documents
 from src.ingestion.embedder import embed_chunks_batched, embed_texts
@@ -79,7 +79,9 @@ SUMMARY_FIELDS = [
     "precision_pre", "recall_pre", "iou_pre",
     "avg_retrieval_ms",
     "n_questions",
-    "cacd_cutoff_used",
+    "cacd_prob_high",
+    "cacd_prob_low",
+    "cacd_nis_threshold",
 ]
 
 PER_Q_FIELDS = [
@@ -254,7 +256,10 @@ def main() -> None:
 
     documents, qa_pairs = load_squad()
     logger.info("Documents: %d | QA pairs: %d", len(documents), len(qa_pairs))
-    logger.info("CACD cutoff (Bayes-optimal) = %.4f", CUTOFF)
+    logger.info(
+        "CACD decision zones: prob_high=%.2f | prob_low=%.2f | nis_threshold=%.2f",
+        PROB_HIGH, PROB_LOW, NIS_DROP_THRESHOLD,
+    )
 
     embed_fn = lambda texts: embed_texts(texts)
 
@@ -332,7 +337,9 @@ def main() -> None:
             "ingest_time_s":             round(ingest_time, 2),
             "storage_mb":                stats["disk_mb"],
             "storage_du":                stats["disk_size_du"],
-            "cacd_cutoff_used":          round(CUTOFF, 4),
+            "cacd_prob_high":            round(PROB_HIGH, 4),
+            "cacd_prob_low":             round(PROB_LOW, 4),
+            "cacd_nis_threshold":        round(NIS_DROP_THRESHOLD, 4),
             **eval_summary,
         }
         writer.writerow(row)
