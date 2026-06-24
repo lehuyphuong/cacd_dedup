@@ -105,6 +105,9 @@ def upsert_chunks(
                     "text":       chunk["text"],
                     "char_start": chunk["char_start"],
                     "char_end":   chunk["char_end"],
+                    # HierarchicalParentChild — dùng để skip parent-child pairs
+                    "parent_id":  chunk.get("parent_id"),
+                    "level":      chunk.get("level"),
                 },
             )
             for chunk, dvec in zip(batch_c, batch_d)

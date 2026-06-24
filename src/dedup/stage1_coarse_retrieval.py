@@ -87,11 +87,13 @@ def batch_coarse_retrieve(
         for hit in points:
             payload = hit.payload or {}
             cands.append({
-                "chunk_id": payload.get("chunk_id", ""),
-                "doc_id":   payload.get("doc_id", ""),
-                "title":    payload.get("title", ""),
-                "text":     payload.get("text", ""),
-                "score":    round(hit.score, 4),
+                "chunk_id":  payload.get("chunk_id", ""),
+                "doc_id":    payload.get("doc_id", ""),
+                "title":     payload.get("title", ""),
+                "text":      payload.get("text", ""),
+                "score":     round(hit.score, 4),
+                "parent_id": payload.get("parent_id"),
+                "level":     payload.get("level"),
             })
         candidates_per_chunk.append(cands)
 

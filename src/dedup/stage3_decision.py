@@ -165,7 +165,14 @@ def run_cacd_dedup(
             continue
 
         # Stage 2 — cross-attention scoring cho từng candidate.
-        scored = score_candidates(chunk["text"], candidates)
+        # Truyền parent_id và level để skip parent-child pairs,
+        # và strip contextual header trước khi score.
+        scored = score_candidates(
+            chunk["text"],
+            candidates,
+            chunk_parent_id=chunk.get("parent_id"),
+            chunk_level=chunk.get("level"),
+        )
 
         # Tính redundancy_signal bổ sung để ghi audit log.
         for s in scored:
@@ -173,8 +180,31 @@ def run_cacd_dedup(
                 s["coverage_a_to_b"], s["coverage_b_to_a"]
             )
 
-        # Chọn candidate có prob_duplicate cao nhất.
-        best = max(scored, key=lambda s: s["prob_duplicate"])
+        # Lọc bỏ candidates đã bị skip (parent-child) trước khi quyết định
+        valid_scored = [s for s in scored if not s.get("skipped", False)]
+
+        if not valid_scored:
+            # Toàn bộ candidates đều là parent/child → không có gì để dedup
+            kept_chunks.append(chunk)
+            upsert_chunks(cname, [chunk], [vec])
+            audit_log.append({
+                "chunk_id":          chunk["chunk_id"],
+                "decision":          "keep",
+                "reason":            "all_candidates_skipped",
+                "best_p_duplicate":  0.0,
+                "best_candidate_id": "",
+                "nis_b_given_a":     1.0,
+                "coverage_a_to_b":   0.0,
+                "coverage_b_to_a":   0.0,
+                "redundancy_signal": 0.0,
+                "prob_high":         round(PROB_HIGH, 4),
+                "prob_low":          round(PROB_LOW, 4),
+                "nis_threshold":     NIS_DROP_THRESHOLD,
+            })
+            continue
+
+        # Chọn candidate có prob_duplicate cao nhất trong số hợp lệ.
+        best = max(valid_scored, key=lambda s: s["prob_duplicate"])
 
         # ── Stage 3 — Quyết định dựa trên NIS (Novel Information Score) ─────
         #

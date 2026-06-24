@@ -237,17 +237,102 @@ def score_pair(text_a: str, text_b: str) -> dict:
 def score_candidates(
     chunk_text: str,
     candidates: list[dict],
+    chunk_parent_id: str | None = None,
+    chunk_level: str | None = None,
 ) -> list[dict]:
     """
     Chấm điểm chunk mới với từng candidate trong danh sách (Stage 2,
     áp dụng cho K ứng viên đã được Stage 1 thu hẹp).
 
+    Xử lý 2 trường hợp đặc biệt trước khi score để tránh false-redundancy:
+
+    1. Contextual chunking — strip header [Context: title | Part N/M]
+       Header giống hệt nhau ở mọi chunk trong cùng 1 document → NIS thấp
+       → drop oan. Strip trước khi score, giữ nguyên text gốc trong Qdrant.
+
+    2. HierarchicalParentChild — skip cặp parent-child (chunk là child của
+       candidate, hoặc ngược lại). Parent và child luôn overlap hoàn toàn
+       về nội dung → không phải "duplicate" theo nghĩa dedup, mà là cấu
+       trúc index đa tầng có chủ đích.
+
     Returns: list dict, mỗi phần tử là candidate gốc được bổ sung
-             các trường score (raw_logit, coverage_a_to_b, ...).
+             các trường score (raw_logit, prob_duplicate, nis_b_given_a...).
+             Candidate bị skip (parent-child) được đánh dấu "skipped=True".
     """
+    # Strip contextual header khỏi chunk mới (A)
+    text_a_clean = _strip_contextual_header(chunk_text)
+
     scored = []
     for cand in candidates:
-        result = score_pair(chunk_text, cand["text"])
-        merged = {**cand, **result}
+        # ── Skip parent-child pairs (HierarchicalParentChild) ─────────────
+        if _is_parent_child_pair(chunk_parent_id, chunk_level,
+                                  cand.get("parent_id"), cand.get("level"),
+                                  cand.get("chunk_id", "")):
+            merged = {**cand, "skipped": True, "skip_reason": "parent_child_pair",
+                      "prob_duplicate": 0.0, "nis_b_given_a": 1.0,
+                      "raw_logit": 0.0, "coverage_a_to_b": 0.0,
+                      "coverage_b_to_a": 0.0}
+            scored.append(merged)
+            continue
+
+        # Strip contextual header khỏi candidate (B)
+        text_b_clean = _strip_contextual_header(cand["text"])
+
+        result = score_pair(text_a_clean, text_b_clean)
+        merged = {**cand, **result, "skipped": False, "skip_reason": ""}
         scored.append(merged)
     return scored
+
+
+import re as _re
+
+def _strip_contextual_header(text: str) -> str:
+    """
+    Loại bỏ header [Context: ... ] do Contextual chunker prepend.
+    Ví dụ: "[Context: Super Bowl 50 | Part 3/12] The game was..."
+         → "The game was..."
+
+    Nếu không có header → trả về text nguyên vẹn.
+    Text gốc trong Qdrant KHÔNG bị thay đổi — chỉ strip khi đưa vào
+    cross-encoder để tránh false-redundancy do header giống nhau.
+    """
+    return _re.sub(r'^\[Context:[^\]]*\]\s*', '', text).strip()
+
+
+def _is_parent_child_pair(
+    chunk_parent_id:  str | None,
+    chunk_level:      str | None,
+    cand_parent_id:   str | None,
+    cand_level:       str | None,
+    cand_chunk_id:    str,
+) -> bool:
+    """
+    Trả về True nếu chunk mới và candidate là cặp parent-child trong
+    HierarchicalParentChild — tức là KHÔNG NÊN so sánh dedup vì chúng
+    overlap theo thiết kế, không phải vì nội dung trùng lặp thật sự.
+
+    Các trường hợp skip:
+      1. chunk là child, candidate là parent của nó
+         (chunk_parent_id == cand_chunk_id)
+      2. chunk là parent, candidate là child của nó
+         (cand_parent_id == chunk của chúng ta — không có chunk_id
+          ở đây nhưng có thể kiểm tra qua level)
+      3. Cả 2 đều là child của cùng 1 parent
+         (chunk_parent_id == cand_parent_id, cả 2 đều có parent_id)
+    """
+    # Trường hợp 1: chunk là child, candidate là parent của nó
+    if chunk_parent_id and chunk_parent_id == cand_chunk_id:
+        return True
+
+    # Trường hợp 2: chunk là parent (level="parent"), candidate là child của nó
+    if chunk_level == "parent" and cand_parent_id:
+        # candidate có parent_id → đây là child; nếu cùng doc thì skip
+        # (không có chunk_id của chunk mới ở đây, dùng heuristic doc-level)
+        if cand_parent_id.startswith(chunk_parent_id or "___NOMATCH___"):
+            return True
+
+    # Trường hợp 3: cả 2 là sibling child của cùng 1 parent
+    # → KHÔNG skip: 2 child chunks có thể thực sự trùng lặp nội dung
+    # nếu chunk_size nhỏ và có overlap → để CACD xử lý bình thường
+
+    return False
