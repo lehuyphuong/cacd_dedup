@@ -25,22 +25,30 @@ from configs.settings import (
     CACD_COST_FALSE_POSITIVE,
     HEATMAP_DIR,
 )
+from src.dedup.calibration import bayes_optimal_cutoff
 from src.dedup.stage1_coarse_retrieval import batch_coarse_retrieve
 from src.dedup.stage2_cross_attention import score_candidates
 
 logger = logging.getLogger(__name__)
 
-# Ngưỡng tự nhiên của msmarco-MiniLM-L6-en-de-v1:
-# prob_duplicate = sigmoid(raw_logit) — model được train để
-# phân biệt duplicate/non-duplicate trực tiếp, nên 0.5 là ranh giới
-# quyết định có căn cứ từ quá trình training, không phải số đoán mò.
-# Bayes-optimal cost ratio vẫn được dùng để điều chỉnh nếu cần ưu
-# tiên precision (tránh drop nhầm) hơn recall (tránh giữ thừa).
-from src.dedup.calibration import bayes_optimal_cutoff
-CUTOFF = bayes_optimal_cutoff(
-    cost_false_positive=CACD_COST_FALSE_POSITIVE,
-    cost_false_negative=CACD_COST_FALSE_NEGATIVE,
-)
+# ── Ngưỡng quyết định Stage 3 ────────────────────────────────────────────────
+#
+# PROB_HIGH: prob_duplicate >= giá trị này → DROP ngay (model rất chắc)
+# PROB_LOW : prob_duplicate <= giá trị này → KEEP ngay (model rất chắc)
+# Vùng [PROB_LOW, PROB_HIGH]: uncertainty zone → NIS quyết định
+#
+# Mặc định: PROB_HIGH=0.8, PROB_LOW=0.2 tạo ra vùng uncertainty [0.2, 0.8]
+# Điều chỉnh bằng cách thay đổi CACD_COST_FP/FN trong settings.py:
+#   CUTOFF = bayes_optimal_cutoff(cost_FP, cost_FN) → dùng làm PROB_HIGH
+#   1 - CUTOFF → dùng làm PROB_LOW (đối xứng)
+_cutoff  = bayes_optimal_cutoff(CACD_COST_FALSE_POSITIVE, CACD_COST_FALSE_NEGATIVE)
+PROB_HIGH = min(0.95, _cutoff + 0.3)   # vd. 0.5 + 0.3 = 0.8
+PROB_LOW  = max(0.05, _cutoff - 0.3)   # vd. 0.5 - 0.3 = 0.2
+
+# NIS_DROP_THRESHOLD: ranh giới tự nhiên của thang entropy chuẩn hóa [0,1]
+# 0.5 = entropy trung bình của token B bằng 50% maximum entropy lý thuyết
+# → B "ít thông tin mới hơn nửa" so với trường hợp hoàn toàn khác A
+NIS_DROP_THRESHOLD = 0.5
 
 
 def save_heatmap(
@@ -87,7 +95,8 @@ def save_heatmap(
     ax.set_ylabel("Chunk mới (A)")
     ax.set_title(
         f"Cross-attention redundancy map\n"
-        f"P(dup)={score_result.get('p_duplicate', 0):.3f} | "
+        f"P(dup)={score_result.get('prob_duplicate', 0):.3f} | "
+        f"NIS={score_result.get('nis_b_given_a', 0):.3f} | "
         f"cov(A→B)={score_result['coverage_a_to_b']:.3f} | "
         f"cov(B→A)={score_result['coverage_b_to_a']:.3f} | "
         f"decision={decision}",
@@ -156,30 +165,64 @@ def run_cacd_dedup(
             continue
 
         # Stage 2 — cross-attention scoring cho từng candidate.
-        # score_candidates trả về prob_duplicate đã là sigmoid(raw_logit)
-        # từ model msmarco-MiniLM-L6-en-de-v1 — model này được train để
-        # phân biệt duplicate/non-duplicate trực tiếp, nên prob_duplicate
-        # là tín hiệu đúng bản chất, không cần qua z-score calibrator.
         scored = score_candidates(chunk["text"], candidates)
 
-        # Tính redundancy_signal bổ sung (coverage-based) để ghi audit log
-        # và vẽ heatmap — KHÔNG dùng để quyết định drop/keep nữa.
+        # Tính redundancy_signal bổ sung để ghi audit log.
         for s in scored:
             s["redundancy_signal"] = min(
                 s["coverage_a_to_b"], s["coverage_b_to_a"]
             )
 
-        # Chọn candidate có prob_duplicate cao nhất để quyết định.
+        # Chọn candidate có prob_duplicate cao nhất.
         best = max(scored, key=lambda s: s["prob_duplicate"])
 
-        # Stage 3 — quyết định dựa trên prob_duplicate với ngưỡng tự nhiên.
-        # CUTOFF = 0.5 khi cost_FP = cost_FN (mặc định đối xứng), tương
-        # đương ngưỡng sigmoid tự nhiên của model. Tăng cost_FP trong
-        # settings.py để hệ thống thận trọng hơn khi drop.
-        if best["prob_duplicate"] > CUTOFF:
+        # ── Stage 3 — Quyết định dựa trên NIS (Novel Information Score) ─────
+        #
+        # Thay vì dùng 1 threshold cố định trên prob_duplicate, kết hợp
+        # prob_duplicate với NIS để xử lý đúng các trường hợp partial
+        # overlap (50%, 60%...) mà binary threshold không giải quyết được:
+        #
+        # Logic 3 vùng:
+        #
+        #  Vùng 1 — prob_duplicate cao (model rất chắc là duplicate):
+        #    → DROP ngay, không cần hỏi NIS
+        #    → NIS có thể không đáng tin ở đây vì model đã rất tự tin
+        #
+        #  Vùng 2 — prob_duplicate thấp (model rất chắc là NOT duplicate):
+        #    → KEEP ngay, không cần hỏi NIS
+        #
+        #  Vùng 3 — prob_duplicate ở giữa (partial overlap, model không chắc):
+        #    → NIS quyết định:
+        #      NIS thấp → B ít thông tin mới so với A → DROP
+        #      NIS cao  → B có nhiều thông tin mới    → KEEP
+        #
+        # Ngưỡng NIS_DROP_THRESHOLD: không phải số đặt tay tùy tiện.
+        # Dựa trên nền tảng Information Theory: NIS = 0.5 nghĩa là
+        # "entropy trung bình của token B bằng 50% maximum entropy lý thuyết"
+        # — tức là token B chỉ "phân tán" sang 50% không gian token A
+        # → B không hoàn toàn mới, nhưng cũng không hoàn toàn giống A.
+        # Chọn 0.5 làm ranh giới tự nhiên của thang entropy chuẩn hóa.
+        #
+        # Các ngưỡng xác suất (PROB_HIGH, PROB_LOW) có thể điều chỉnh
+        # trong settings.py mà không cần sửa code.
+
+        prob = best["prob_duplicate"]
+        nis  = best["nis_b_given_a"]
+
+        if prob >= PROB_HIGH:
             decision = "drop"
-        else:
+            reason   = f"prob_high ({prob:.3f} >= {PROB_HIGH})"
+        elif prob <= PROB_LOW:
             decision = "keep"
+            reason   = f"prob_low ({prob:.3f} <= {PROB_LOW})"
+        else:
+            # Vùng không chắc chắn → NIS quyết định
+            if nis < NIS_DROP_THRESHOLD:
+                decision = "drop"
+                reason   = f"nis_low ({nis:.3f} < {NIS_DROP_THRESHOLD}, prob={prob:.3f})"
+            else:
+                decision = "keep"
+                reason   = f"nis_high ({nis:.3f} >= {NIS_DROP_THRESHOLD}, prob={prob:.3f})"
 
         if save_heatmaps and n_heatmaps_saved < max_heatmaps:
             save_heatmap(
@@ -191,14 +234,16 @@ def run_cacd_dedup(
         audit_log.append({
             "chunk_id":           chunk["chunk_id"],
             "decision":           decision,
-            "reason":             "prob_duplicate_cutoff",
+            "reason":             reason,
             "best_p_duplicate":   best["prob_duplicate"],
             "best_candidate_id":  best["chunk_id"],
+            "nis_b_given_a":      best["nis_b_given_a"],
             "coverage_a_to_b":    best["coverage_a_to_b"],
             "coverage_b_to_a":    best["coverage_b_to_a"],
             "redundancy_signal":  best["redundancy_signal"],
-            "attn_entropy":       best["attn_entropy"],
-            "cutoff_used":        round(CUTOFF, 4),
+            "prob_high":          round(PROB_HIGH, 4),
+            "prob_low":           round(PROB_LOW, 4),
+            "nis_threshold":      NIS_DROP_THRESHOLD,
         })
 
         if decision == "keep":
@@ -208,12 +253,16 @@ def run_cacd_dedup(
         if (i + 1) % 50 == 0:
             n_dropped = (i + 1) - len(kept_chunks)
             logger.info(
-                "  CACD progress: %d/%d chunks xử lý | kept=%d | dropped=%d | cutoff=%.4f",
-                i + 1, len(chunks), len(kept_chunks), n_dropped, CUTOFF,
+                "  CACD progress: %d/%d | kept=%d | dropped=%d | "
+                "prob_range=[%.2f,%.2f] | nis_thresh=%.2f",
+                i + 1, len(chunks), len(kept_chunks), n_dropped,
+                PROB_LOW, PROB_HIGH, NIS_DROP_THRESHOLD,
             )
 
     logger.info(
-        "  CACD done: %d → %d chunks giữ lại (cutoff=%.4f)",
-        len(chunks), len(kept_chunks), CUTOFF,
+        "  CACD done: %d → %d chunks giữ lại "
+        "(prob_range=[%.2f,%.2f], nis_thresh=%.2f)",
+        len(chunks), len(kept_chunks),
+        PROB_LOW, PROB_HIGH, NIS_DROP_THRESHOLD,
     )
     return kept_chunks, audit_log

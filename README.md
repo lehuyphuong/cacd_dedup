@@ -45,7 +45,7 @@ Stage 2 — Cross-attention redundancy scoring
     2b. Trích xuất attention matrix (layer cuối, average qua head)
     2c. Tổng hợp redundancy signal (max-alignment kiểu BERTScore)
     2d. Output calibrated probability P(duplicate)
-    Model: cross-encoder/ms-marco-MiniLM-L-6-v2 (pretrained, không fine-tune)
+    Model: cross-encoder/msmarco-MiniLM-L6-en-de-v1 (pretrained, không fine-tune)
     │
     ▼
 Stage 3 — Quyết định threshold-free (CHỈ nhánh DROP)
@@ -99,13 +99,13 @@ python -m spacy download en_core_web_sm
 
 Lần chạy đầu tiên sẽ tự động tải về:
 - `sentence-transformers/all-MiniLM-L6-v2` (~80MB) — Stage 0
-- `cross-encoder/ms-marco-MiniLM-L-6-v2` (~90MB) — Stage 2
+- `cross-encoder/msmarco-MiniLM-L6-en-de-v1` (~90MB) — Stage 2
 
 ### 5.2 Verify cài đặt
 
 ```bash
 python -c "from sentence_transformers import SentenceTransformer; m = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2'); print('embed OK:', m.encode(['test']).shape)"
-python -c "from transformers import AutoModelForSequenceClassification, AutoTokenizer; m = AutoModelForSequenceClassification.from_pretrained('cross-encoder/ms-marco-MiniLM-L-6-v2'); print('cross-encoder OK')"
+python -c "from transformers import AutoModelForSequenceClassification, AutoTokenizer; m = AutoModelForSequenceClassification.from_pretrained('cross-encoder/msmarco-MiniLM-L6-en-de-v1'); print('cross-encoder OK')"
 python -c "from qdrant_client import QdrantClient; c = QdrantClient(':memory:'); print('qdrant OK')"
 python -c "import torch; print('GPU available:', torch.cuda.is_available())"
 ```

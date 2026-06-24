@@ -25,7 +25,7 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-MODEL_NAME = "cross-encoder/quora-distilroberta-base"
+MODEL_NAME = "cross-encoder/msmarco-MiniLM-L6-en-de-v1"
 DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 OUT_DIR    = Path("results/calibration_experiments")
 OUT_DIR.mkdir(parents=True, exist_ok=True)

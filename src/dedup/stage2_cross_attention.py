@@ -94,23 +94,72 @@ def _max_alignment_coverage(
     return coverage_a_to_b, coverage_b_to_a
 
 
-def _attention_entropy(attn: torch.Tensor, sep_idx: int, n_tokens: int) -> float:
+def _novel_information_score(
+    attn: torch.Tensor,
+    sep_idx: int,
+    n_tokens: int,
+) -> float:
     """
-    Tín hiệu phụ: entropy của attention cross-block (A→B).
-    Entropy thấp = tập trung rõ ràng (match mạnh); entropy cao = tản mát.
-    Trả về entropy đã chuẩn hóa về [0, 1] (1 = tản mát tối đa).
+    Novel Information Score (NIS) — đo mức độ thông tin MỚI mà B mang
+    lại so với A, dựa trên entropy của attention distribution B→A.
+
+    Nền tảng lý thuyết (Information Theory):
+      - Attention B→A[j, :] = phân phối xác suất token j của B
+        "dựa vào" các token nào trong A để hiểu nghĩa của mình
+      - Entropy(attention B→A[j]) thấp → token j tập trung attention
+        vào 1-2 token cụ thể trong A → A "giải thích" được token j
+        → token j KHÔNG mang thông tin mới
+      - Entropy(attention B→A[j]) cao → token j phân tán attention
+        đều khắp A → A không có token nào "giải thích" được token j
+        → token j CÓ THỂ mang thông tin mới
+
+    NIS(B|A) = mean entropy của attention B→A, chuẩn hóa về [0, 1]:
+      NIS → 0: B hoàn toàn được "giải thích" bởi A → DROP candidate
+      NIS → 1: B hoàn toàn khác A về thông tin       → KEEP
+
+    Quan trọng: chuẩn hóa dùng log(|A|) — maximum entropy lý thuyết
+    khi token B phân tán đều hoàn toàn sang tất cả token A.
+    Đây là ngưỡng tự nhiên từ Information Theory, không phải số đặt tay.
+
+    Args:
+        attn    : ma trận attention (n_tokens, n_tokens), đã average head.
+        sep_idx : vị trí [SEP] đầu tiên (ranh giới A/B).
+        n_tokens: tổng số token thật.
+
+    Returns:
+        nis: float trong [0, 1], càng thấp → B càng ít thông tin mới.
     """
     a_range = slice(1, sep_idx)
     b_range = slice(sep_idx + 1, n_tokens - 1)
-    sub = attn[a_range, b_range]
-    if sub.numel() == 0:
+
+    sub_b_to_a = attn[b_range, a_range]   # (len_B, len_A)
+
+    if sub_b_to_a.numel() == 0:
+        return 1.0   # Không có gì để so sánh → coi như B hoàn toàn mới
+
+    len_a = sub_b_to_a.shape[1]
+    if len_a < 2:
         return 1.0
 
-    probs = sub / (sub.sum(dim=1, keepdim=True) + 1e-9)
-    ent = -(probs * torch.log(probs + 1e-9)).sum(dim=1)
-    max_ent = np.log(max(sub.shape[1], 2))
-    norm_ent = (ent / max_ent).mean().item()
-    return float(np.clip(norm_ent, 0.0, 1.0))
+    # Chuẩn hóa lại attention B→A CHỈ TRÊN PHẦN A
+    # (loại bỏ ảnh hưởng pha loãng của softmax toàn chuỗi)
+    row_sums = sub_b_to_a.sum(dim=1, keepdim=True).clamp(min=1e-9)
+    prob_b_to_a = sub_b_to_a / row_sums   # (len_B, len_A), mỗi hàng sum=1
+
+    # Entropy của từng token B
+    # H(j) = -sum_i p(i|j) * log(p(i|j))
+    ent_per_token = -(prob_b_to_a * torch.log(prob_b_to_a + 1e-9)).sum(dim=1)  # (len_B,)
+
+    # Maximum entropy lý thuyết = log(len_A)
+    # Đây là ngưỡng tự nhiên: token B phân tán đều hoàn toàn sang mọi A
+    max_ent = float(np.log(len_a))
+
+    if max_ent < 1e-9:
+        return 1.0
+
+    # NIS = mean normalized entropy
+    nis = float((ent_per_token / max_ent).mean().clamp(0.0, 1.0).item())
+    return round(nis, 4)
 
 
 @torch.no_grad()
@@ -169,14 +218,14 @@ def score_pair(text_a: str, text_b: str) -> dict:
     sep_idx = int(sep_positions[0].item()) if len(sep_positions) > 0 else n_tokens // 2
 
     cov_a_to_b, cov_b_to_a = _max_alignment_coverage(avg_attn, sep_idx, n_tokens)
-    entropy = _attention_entropy(avg_attn, sep_idx, n_tokens)
+    nis = _novel_information_score(avg_attn, sep_idx, n_tokens)
 
     return {
         "raw_logit":        round(raw_logit, 4),
-        "prob_duplicate":   round(prob_dup, 4),   # tín hiệu chính cho Stage 3
+        "prob_duplicate":   round(prob_dup, 4),
         "coverage_a_to_b":  round(cov_a_to_b, 4),
         "coverage_b_to_a":  round(cov_b_to_a, 4),
-        "attn_entropy":     round(entropy, 4),
+        "nis_b_given_a":    nis,                    # Novel Information Score
         "attention_matrix": avg_attn[:n_tokens, :n_tokens].cpu().numpy(),
         "tokens_a":         tokens[1:sep_idx],
         "tokens_b":         tokens[sep_idx + 1:n_tokens - 1],

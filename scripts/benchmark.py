@@ -92,8 +92,8 @@ PER_Q_FIELDS = [
 AUDIT_FIELDS = [
     "chunk_id", "decision", "reason",
     "best_p_duplicate", "best_candidate_id",
-    "coverage_a_to_b", "coverage_b_to_a", "redundancy_signal", "attn_entropy",
-    "cutoff_used",
+    "nis_b_given_a", "coverage_a_to_b", "coverage_b_to_a",
+    "redundancy_signal", "prob_high", "prob_low", "nis_threshold",
 ]
 
 
