@@ -233,6 +233,7 @@ def main() -> None:
     parser.add_argument(
         "--strategy", type=str, default=None,
         choices=[
+            "FixedSize", "Recursive", "Semantic", "Overlapping",
             "AdaptiveEntropy", "AdaptiveSentenceLen",
             "HierarchicalParentChild", "Contextual", "TopicBased",
         ],

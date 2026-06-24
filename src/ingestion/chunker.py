@@ -441,6 +441,235 @@ def topic_based_chunker(
     return [c for c in chunks if c["text"]]
 
 
+# ── Classic chunkers (v3-compatible) ──────────────────────────────────────────
+
+def fixed_size_chunker(
+    doc: dict,
+    chunk_size: int = 500,
+    overlap: int = 0,
+) -> list[dict]:
+    """
+    FixedSize — cắt text theo số ký tự cố định, không quan tâm ranh giới
+    câu hay từ. Đây là phương pháp đơn giản nhất, dùng làm baseline.
+
+    overlap > 0 → tạo sliding window (mỗi chunk kế tiếp bắt đầu lùi lại
+    `overlap` ký tự so với điểm kết thúc của chunk trước).
+    """
+    text   = doc["text"]
+    chunks = []
+    idx    = 0
+    start  = 0
+    step   = max(1, chunk_size - overlap)
+
+    while start < len(text):
+        end  = min(start + chunk_size, len(text))
+        span = text[start:end].strip()
+        if span:
+            chunks.append(_make_chunk(
+                doc, f"{doc['doc_id']}_{idx}", span, start, end,
+            ))
+            idx += 1
+        start += step
+
+    return chunks
+
+
+def recursive_chunker(
+    doc: dict,
+    chunk_size: int = 500,
+    overlap: int = 0,
+) -> list[dict]:
+    """
+    Recursive / RecursiveCharacterTextSplitter — cắt theo ưu tiên phân
+    cấp: paragraph (\\n\\n) → sentence (. ! ?) → space → ký tự.
+
+    Đây là chiến lược mặc định của LangChain và được dùng làm baseline
+    chính trong paper Berdyugina et al. (2026, arXiv:2604.24334).
+    """
+    separators = ["\n\n", "\n", ". ", "! ", "? ", " ", ""]
+
+    def _split(text: str, seps: list[str]) -> list[str]:
+        if not seps:
+            return [text[i:i + chunk_size] for i in range(0, len(text), max(1, chunk_size - overlap))]
+        sep = seps[0]
+        parts = text.split(sep) if sep else list(text)
+        result: list[str] = []
+        buf = ""
+        for part in parts:
+            candidate = (buf + sep + part).strip() if buf else part.strip()
+            if len(candidate) <= chunk_size:
+                buf = candidate
+            else:
+                if buf:
+                    result.append(buf)
+                if len(part) > chunk_size:
+                    result.extend(_split(part, seps[1:]))
+                    buf = ""
+                else:
+                    buf = part.strip()
+        if buf:
+            result.append(buf)
+        return result
+
+    text   = doc["text"]
+    pieces = _split(text, separators)
+
+    # Merge tiny pieces into neighbours and apply overlap
+    merged: list[str] = []
+    buf = ""
+    for p in pieces:
+        if not p.strip():
+            continue
+        candidate = (buf + " " + p).strip() if buf else p.strip()
+        if len(candidate) <= chunk_size:
+            buf = candidate
+        else:
+            if buf:
+                merged.append(buf)
+            buf = p.strip()
+    if buf:
+        merged.append(buf)
+
+    # Apply overlap: each chunk starts `overlap` chars before the end of prev
+    chunks  = []
+    carried = ""
+    for i, piece in enumerate(merged):
+        text_with_carry = (carried + " " + piece).strip() if carried else piece
+        chunk_text = text_with_carry[:chunk_size].strip()
+        if chunk_text:
+            start = text.find(chunk_text[:30]) if chunk_text[:30] in text else 0
+            chunks.append(_make_chunk(
+                doc, f"{doc['doc_id']}_{i}", chunk_text, start, start + len(chunk_text),
+            ))
+        # Carry-over for overlap
+        if overlap > 0 and chunk_text:
+            carried = chunk_text[-overlap:].strip()
+        else:
+            carried = ""
+
+    return chunks
+
+
+def semantic_chunker(
+    doc: dict,
+    threshold_percentile: float = 95.0,
+    embed_fn: Callable | None = None,
+) -> list[dict]:
+    """
+    SemanticChunker / ClusterSemantic (v3) — cắt tại điểm có cosine
+    distance giữa 2 câu liên tiếp vượt ngưỡng percentile.
+
+    Đây là chiến lược "sequential breakpoint detection" — chỉ nhìn vào
+    khoảng cách ngữ nghĩa CỤC BỘ (local) giữa 2 câu kề nhau, khác với
+    TopicBased dùng global clustering.
+
+    Fallback: nếu không có embed_fn, dùng RecursiveChunker.
+    """
+    if embed_fn is None:
+        logger.debug("SemanticChunker: no embed_fn, falling back to RecursiveChunker")
+        return recursive_chunker(doc, chunk_size=500, overlap=0)
+
+    sentences = _sentence_split(doc["text"])
+    if len(sentences) < 3:
+        return recursive_chunker(doc, chunk_size=500, overlap=0)
+
+    # Embed từng câu
+    vecs = np.array(embed_fn(sentences), dtype=np.float32)
+
+    # Chuẩn hóa L2
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+    norms = np.where(norms < 1e-9, 1.0, norms)
+    vecs  = vecs / norms
+
+    # Cosine distance giữa câu liên tiếp
+    distances = [
+        float(1.0 - np.dot(vecs[i], vecs[i + 1]))
+        for i in range(len(vecs) - 1)
+    ]
+
+    threshold = float(np.percentile(distances, threshold_percentile))
+
+    # Cắt tại điểm distance > threshold
+    chunks  = []
+    buf     = [sentences[0]]
+    chunk_i = 0
+    text    = doc["text"]
+    cursor  = 0
+
+    for i, dist in enumerate(distances):
+        if dist >= threshold:
+            chunk_text = " ".join(buf).strip()
+            if chunk_text:
+                start = _find_offset(text, buf[0], cursor)
+                end   = start + len(chunk_text)
+                chunks.append(_make_chunk(
+                    doc, f"{doc['doc_id']}_{chunk_i}", chunk_text, start, end,
+                ))
+                cursor   = end
+                chunk_i += 1
+            buf = [sentences[i + 1]]
+        else:
+            buf.append(sentences[i + 1])
+
+    # Flush
+    if buf:
+        chunk_text = " ".join(buf).strip()
+        if chunk_text:
+            start = _find_offset(text, buf[0], cursor)
+            end   = start + len(chunk_text)
+            chunks.append(_make_chunk(
+                doc, f"{doc['doc_id']}_{chunk_i}", chunk_text, start, end,
+            ))
+
+    return chunks if chunks else recursive_chunker(doc, chunk_size=500, overlap=0)
+
+
+def overlapping_chunker(
+    doc: dict,
+    chunk_size: int = 500,
+    overlap: int = 100,
+) -> list[dict]:
+    """
+    Overlapping / SlidingWindow — giống FixedSize nhưng luôn có overlap
+    giữa các chunk liên tiếp, đảm bảo không bị mất thông tin tại ranh
+    giới chunk. Đây là một trong các baseline phổ biến nhất trong RAG.
+
+    Khác với FixedSize(overlap>0): Overlapping cắt tại ranh giới từ
+    (không cắt giữa từ) để chunk text vẫn có nghĩa.
+
+    overlap phải < chunk_size. Mặc định overlap = chunk_size // 5.
+    """
+    if overlap >= chunk_size:
+        overlap = chunk_size // 5
+        logger.warning("overlap >= chunk_size, clamped to %d", overlap)
+
+    text   = doc["text"]
+    words  = text.split()
+    chunks = []
+    idx    = 0
+
+    # Ước lượng số từ mỗi chunk theo tỷ lệ chars/words trung bình
+    avg_word_len = len(text) / max(len(words), 1)
+    words_per_chunk = max(1, int(chunk_size / avg_word_len))
+    words_overlap   = max(0, int(overlap   / avg_word_len))
+    step = max(1, words_per_chunk - words_overlap)
+
+    i = 0
+    while i < len(words):
+        chunk_words = words[i:i + words_per_chunk]
+        chunk_text  = " ".join(chunk_words).strip()
+        if chunk_text:
+            start = text.find(chunk_text[:40]) if chunk_text[:40] in text else 0
+            end   = start + len(chunk_text)
+            chunks.append(_make_chunk(
+                doc, f"{doc['doc_id']}_{idx}", chunk_text, start, end,
+            ))
+            idx += 1
+        i += step
+
+    return chunks
+
+
 # ── Registry ──────────────────────────────────────────────────────────────────
 
 def get_chunker(
@@ -453,7 +682,25 @@ def get_chunker(
     """Return a callable(doc) → list[chunk] for the given strategy."""
     extra = extra or {}
 
-    if strategy == "AdaptiveEntropy":
+    if strategy == "FixedSize":
+        return lambda doc: fixed_size_chunker(
+            doc, chunk_size=chunk_size, overlap=overlap,
+        )
+    elif strategy == "Recursive":
+        return lambda doc: recursive_chunker(
+            doc, chunk_size=chunk_size, overlap=overlap,
+        )
+    elif strategy == "Semantic":
+        return lambda doc, _fn=embed_fn: semantic_chunker(
+            doc,
+            threshold_percentile=extra.get("threshold_percentile", 95.0),
+            embed_fn=_fn,
+        )
+    elif strategy == "Overlapping":
+        return lambda doc: overlapping_chunker(
+            doc, chunk_size=chunk_size, overlap=overlap,
+        )
+    elif strategy == "AdaptiveEntropy":
         return lambda doc: adaptive_entropy_chunker(
             doc,
             base_size=chunk_size,

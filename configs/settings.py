@@ -98,6 +98,24 @@ If the answer is not in the context, respond with exactly: "I don't know."\
 
 def _make_configs() -> list[dict]:
     chunker_configs = [
+        # ── FixedSize (baseline đơn giản nhất) ──────────────────────────────
+        {"strategy": "FixedSize",   "chunk_size": 300, "overlap": 0},
+        {"strategy": "FixedSize",   "chunk_size": 500, "overlap": 0},
+
+        # ── Recursive (baseline chính của paper gốc) ─────────────────────────
+        {"strategy": "Recursive",   "chunk_size": 300, "overlap": 0},
+        {"strategy": "Recursive",   "chunk_size": 500, "overlap": 0},
+
+        # ── Semantic (sequential cosine breakpoint, ClusterSemantic v3) ──────
+        {"strategy": "Semantic",    "chunk_size": 300, "overlap": 0,
+         "extra": {"threshold_percentile": 95.0}},
+        {"strategy": "Semantic",    "chunk_size": 500, "overlap": 0,
+         "extra": {"threshold_percentile": 95.0}},
+
+        # ── Overlapping / SlidingWindow ────────────────────────────────────
+        {"strategy": "Overlapping", "chunk_size": 300, "overlap": 60},
+        {"strategy": "Overlapping", "chunk_size": 500, "overlap": 100},
+
         # ── AdaptiveEntropy ─────────────────────────────────────────────────
         {"strategy": "AdaptiveEntropy",       "chunk_size": 300, "overlap": 0},
         {"strategy": "AdaptiveEntropy",       "chunk_size": 500, "overlap": 0},
