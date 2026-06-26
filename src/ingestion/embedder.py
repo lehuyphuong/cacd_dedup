@@ -21,7 +21,7 @@ from typing import Generator
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-from configs.settings import EMBED_BATCH_SIZE, EMBED_MODEL, TEXT_EMBED_DIM
+from configs.settings import DEVICE, EMBED_BATCH_SIZE, EMBED_MODEL, TEXT_EMBED_DIM
 
 logger = logging.getLogger(__name__)
 
@@ -29,13 +29,14 @@ _model: SentenceTransformer | None = None
 
 
 def get_model() -> SentenceTransformer:
-    """Lazy-load and cache the embedding model."""
+    """Lazy-load and cache the embedding model on the correct device."""
     global _model
     if _model is None:
-        logger.info("Loading embedding model: %s", EMBED_MODEL)
-        _model = SentenceTransformer(EMBED_MODEL)
+        logger.info("Loading embedding model: %s on %s", EMBED_MODEL, DEVICE)
+        _model = SentenceTransformer(EMBED_MODEL, device=DEVICE)
         logger.info(
-            "Model loaded — output dim: %d", _model.get_sentence_embedding_dimension()
+            "Embedding model loaded — dim: %d | device: %s",
+            _model.get_sentence_embedding_dimension(), DEVICE,
         )
     return _model
 

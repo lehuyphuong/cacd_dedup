@@ -45,7 +45,9 @@ MAX_EVAL_QUESTIONS:  int | None = 200
 # ── Embedding — all-MiniLM-L6-v2 (Stage 0) ───────────────────────────────────
 EMBED_MODEL      = "sentence-transformers/all-MiniLM-L6-v2"
 TEXT_EMBED_DIM   = 384
-EMBED_BATCH_SIZE = 128
+# Batch size lớn hơn tận dụng GPU tốt hơn.
+# GPU 8GB+: 512–1024. CPU: giữ 128.
+EMBED_BATCH_SIZE = 512 if torch.cuda.is_available() else 128
 
 # ── CACD — Stage 1 (Coarse retrieval) ────────────────────────────────────────
 CACD_TOP_K_CANDIDATES = 5   # K ứng viên gần nhất lấy ra từ HNSW mỗi chunk

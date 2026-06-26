@@ -236,6 +236,105 @@ def score_pair(text_a: str, text_b: str) -> dict:
     }
 
 
+@torch.no_grad()
+def score_candidates_batched(
+    chunk_text: str,
+    candidates: list[dict],
+    chunk_parent_id: str | None = None,
+    chunk_level: str | None = None,
+) -> list[dict]:
+    """
+    Batch version của score_candidates — gom tất cả K candidates thành
+    1 forward pass duy nhất thay vì K lần riêng lẻ.
+
+    Trên GPU: 1 batch forward pass tận dụng parallelism của GPU tốt hơn
+    K lần sequential rất nhiều. Với K=5 và GPU mạnh, speedup ~3-4x.
+
+    Vẫn xử lý đầy đủ:
+      - Strip contextual header trước khi score
+      - Skip parent-child pairs
+      - Tính NIS từ attention của từng cặp (attention không share được
+        giữa các cặp nên vẫn cần xử lý riêng, nhưng forward pass được batch)
+    """
+    tokenizer, model = get_cross_encoder()
+    text_a_clean = _strip_contextual_header(chunk_text)
+
+    # Phân loại candidates: skip vs score
+    to_score: list[tuple[int, dict]] = []   # (original_idx, candidate)
+    results: list[dict] = []
+
+    for i, cand in enumerate(candidates):
+        if _is_parent_child_pair(
+            chunk_parent_id, chunk_level,
+            cand.get("parent_id"), cand.get("level"),
+            cand.get("chunk_id", ""),
+        ):
+            results.append({**cand,
+                "skipped": True, "skip_reason": "parent_child_pair",
+                "prob_duplicate": 0.0, "nis_b_given_a": 1.0,
+                "raw_logit": 0.0, "coverage_a_to_b": 0.0,
+                "coverage_b_to_a": 0.0,
+            })
+        else:
+            to_score.append((i, cand))
+            results.append(None)   # placeholder
+
+    if not to_score:
+        return results
+
+    # Tokenize tất cả cặp cùng lúc — 1 batch
+    texts_b = [_strip_contextual_header(cand["text"]) for _, cand in to_score]
+    texts_a  = [text_a_clean] * len(texts_b)
+
+    inputs = tokenizer(
+        texts_a, texts_b,
+        return_tensors="pt",
+        truncation=True,
+        max_length=256,
+        padding=True,   # pad về cùng độ dài trong batch
+    ).to(DEVICE)
+
+    outputs = model(**inputs)
+
+    # Xử lý từng kết quả trong batch
+    logits_batch    = outputs.logits          # (batch, num_labels)
+    attentions_last = outputs.attentions[-1]  # (batch, num_heads, seq, seq)
+
+    for batch_i, (orig_i, cand) in enumerate(to_score):
+        logits = logits_batch[batch_i]
+        if logits.dim() == 0 or logits.shape[0] == 1:
+            prob_dup = float(torch.sigmoid(logits.squeeze()).item())
+            raw_logit = logits.squeeze().item()
+        else:
+            prob_dup  = float(torch.softmax(logits, dim=-1)[-1].item())
+            raw_logit = logits[-1].item()
+
+        # Attention của cặp này trong batch
+        avg_attn = attentions_last[batch_i].mean(dim=0)  # (seq, seq)
+
+        input_ids = inputs["input_ids"][batch_i]
+        n_tokens  = int(inputs["attention_mask"][batch_i].sum().item())
+        sep_id    = tokenizer.sep_token_id
+        sep_pos   = (input_ids == sep_id).nonzero(as_tuple=True)[0]
+        sep_idx   = int(sep_pos[0].item()) if len(sep_pos) > 0 else n_tokens // 2
+
+        cov_a2b, cov_b2a = _max_alignment_coverage(avg_attn, sep_idx, n_tokens)
+        nis = _novel_information_score(avg_attn, sep_idx, n_tokens)
+
+        results[orig_i] = {
+            **cand,
+            "skipped":        False,
+            "skip_reason":    "",
+            "raw_logit":      round(raw_logit, 4),
+            "prob_duplicate": round(prob_dup, 4),
+            "coverage_a_to_b": round(cov_a2b, 4),
+            "coverage_b_to_a": round(cov_b2a, 4),
+            "nis_b_given_a":  nis,
+        }
+
+    return results
+
+
 def score_candidates(
     chunk_text: str,
     candidates: list[dict],
@@ -243,47 +342,12 @@ def score_candidates(
     chunk_level: str | None = None,
 ) -> list[dict]:
     """
-    Chấm điểm chunk mới với từng candidate trong danh sách (Stage 2,
-    áp dụng cho K ứng viên đã được Stage 1 thu hẹp).
-
-    Xử lý 2 trường hợp đặc biệt trước khi score để tránh false-redundancy:
-
-    1. Contextual chunking — strip header [Context: title | Part N/M]
-       Header giống hệt nhau ở mọi chunk trong cùng 1 document → NIS thấp
-       → drop oan. Strip trước khi score, giữ nguyên text gốc trong Qdrant.
-
-    2. HierarchicalParentChild — skip cặp parent-child (chunk là child của
-       candidate, hoặc ngược lại). Parent và child luôn overlap hoàn toàn
-       về nội dung → không phải "duplicate" theo nghĩa dedup, mà là cấu
-       trúc index đa tầng có chủ đích.
-
-    Returns: list dict, mỗi phần tử là candidate gốc được bổ sung
-             các trường score (raw_logit, prob_duplicate, nis_b_given_a...).
-             Candidate bị skip (parent-child) được đánh dấu "skipped=True".
+    Wrapper gọi score_candidates_batched — giữ nguyên interface cũ
+    để stage3_decision.py không cần sửa.
     """
-    # Strip contextual header khỏi chunk mới (A)
-    text_a_clean = _strip_contextual_header(chunk_text)
-
-    scored = []
-    for cand in candidates:
-        # ── Skip parent-child pairs (HierarchicalParentChild) ─────────────
-        if _is_parent_child_pair(chunk_parent_id, chunk_level,
-                                  cand.get("parent_id"), cand.get("level"),
-                                  cand.get("chunk_id", "")):
-            merged = {**cand, "skipped": True, "skip_reason": "parent_child_pair",
-                      "prob_duplicate": 0.0, "nis_b_given_a": 1.0,
-                      "raw_logit": 0.0, "coverage_a_to_b": 0.0,
-                      "coverage_b_to_a": 0.0}
-            scored.append(merged)
-            continue
-
-        # Strip contextual header khỏi candidate (B)
-        text_b_clean = _strip_contextual_header(cand["text"])
-
-        result = score_pair(text_a_clean, text_b_clean)
-        merged = {**cand, **result, "skipped": False, "skip_reason": ""}
-        scored.append(merged)
-    return scored
+    return score_candidates_batched(
+        chunk_text, candidates, chunk_parent_id, chunk_level,
+    )
 
 
 import re as _re
