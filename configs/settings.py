@@ -39,9 +39,11 @@ HEATMAP_DIR.mkdir(exist_ok=True)
 # ── Dataset ──────────────────────────────────────────────────────────────────
 DATASET_NAME       = "rajpurkar/squad"
 DATASET_SPLIT      = "validation"
-MAX_DOCUMENTS:       int | None = 500
-MAX_EVAL_QUESTIONS:  int | None = 200
+# MAX_DOCUMENTS:       int | None = 500
+# MAX_EVAL_QUESTIONS:  int | None = 200
 
+MAX_DOCUMENTS:       int | None = None
+MAX_EVAL_QUESTIONS:  int | None = None
 # ── Embedding — all-MiniLM-L6-v2 (Stage 0) ───────────────────────────────────
 EMBED_MODEL      = "sentence-transformers/all-MiniLM-L6-v2"
 TEXT_EMBED_DIM   = 384
@@ -100,23 +102,23 @@ If the answer is not in the context, respond with exactly: "I don't know."\
 
 def _make_configs() -> list[dict]:
     chunker_configs = [
-        # ── FixedSize (baseline đơn giản nhất) ──────────────────────────────
-        {"strategy": "FixedSize",   "chunk_size": 300, "overlap": 0},
-        {"strategy": "FixedSize",   "chunk_size": 500, "overlap": 0},
+        # ── FixedSize ≡ FixedToken (paper chunk_size=200,400) ───────────────
+        {"strategy": "FixedSize",   "chunk_size": 200, "overlap": 0},
+        {"strategy": "FixedSize",   "chunk_size": 400, "overlap": 0},
 
-        # ── Recursive (baseline chính của paper gốc) ─────────────────────────
-        {"strategy": "Recursive",   "chunk_size": 300, "overlap": 0},
-        {"strategy": "Recursive",   "chunk_size": 500, "overlap": 0},
+        # ── Recursive ≡ RecursiveToken (paper chunk_size=200,400) ────────────
+        {"strategy": "RecursiveToken",   "chunk_size": 200, "overlap": 0},
+        {"strategy": "RecursiveToken",   "chunk_size": 400, "overlap": 0},
 
-        # ── Semantic (sequential cosine breakpoint, ClusterSemantic v3) ──────
-        {"strategy": "Semantic",    "chunk_size": 300, "overlap": 0,
+        # ── Semantic ≡ ClusterSemantic (paper chunk_size=200,400) ─────────────
+        {"strategy": "ClusterSemantic",    "chunk_size": 200, "overlap": 0,
          "extra": {"threshold_percentile": 95.0}},
-        {"strategy": "Semantic",    "chunk_size": 500, "overlap": 0,
+        {"strategy": "ClusterSemantic",    "chunk_size": 400, "overlap": 0,
          "extra": {"threshold_percentile": 95.0}},
 
-        # ── Overlapping / SlidingWindow ────────────────────────────────────
-        {"strategy": "Overlapping", "chunk_size": 300, "overlap": 60},
-        {"strategy": "Overlapping", "chunk_size": 500, "overlap": 100},
+        # ── Overlapping (paper chunk_size=400/overlap=200, 800/overlap=400) ──
+        {"strategy": "Overlapping", "chunk_size": 400, "overlap": 200},
+        {"strategy": "Overlapping", "chunk_size": 800, "overlap": 400},
 
         # ── AdaptiveEntropy ─────────────────────────────────────────────────
         {"strategy": "AdaptiveEntropy",       "chunk_size": 300, "overlap": 0},
