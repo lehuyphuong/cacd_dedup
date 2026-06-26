@@ -225,12 +225,14 @@ def score_pair(text_a: str, text_b: str) -> dict:
         "prob_duplicate":   round(prob_dup, 4),
         "coverage_a_to_b":  round(cov_a_to_b, 4),
         "coverage_b_to_a":  round(cov_b_to_a, 4),
-        "nis_b_given_a":    nis,                    # Novel Information Score
-        "attention_matrix": avg_attn[:n_tokens, :n_tokens].cpu().numpy(),
-        "tokens_a":         tokens[1:sep_idx],
-        "tokens_b":         tokens[sep_idx + 1:n_tokens - 1],
-        "sep_idx":          sep_idx,
-        "n_tokens":         n_tokens,
+        "nis_b_given_a":    nis,
+        # attention_matrix và tokens disabled — heatmap off, không cần serialize
+        # Uncomment khi cần vẽ heatmap phân tích:
+        # "attention_matrix": avg_attn[:n_tokens, :n_tokens].cpu().numpy(),
+        # "tokens_a":         tokens[1:sep_idx],
+        # "tokens_b":         tokens[sep_idx + 1:n_tokens - 1],
+        # "sep_idx":          sep_idx,
+        # "n_tokens":         n_tokens,
     }
 
 

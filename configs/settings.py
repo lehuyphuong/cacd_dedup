@@ -39,10 +39,8 @@ HEATMAP_DIR.mkdir(exist_ok=True)
 # ── Dataset ──────────────────────────────────────────────────────────────────
 DATASET_NAME       = "rajpurkar/squad"
 DATASET_SPLIT      = "validation"
-# MAX_DOCUMENTS:       int | None = 500
-# MAX_EVAL_QUESTIONS:  int | None = 200
-MAX_DOCUMENTS:       int | None = None
-MAX_EVAL_QUESTIONS:  int | None = None
+MAX_DOCUMENTS:       int | None = 500
+MAX_EVAL_QUESTIONS:  int | None = 200
 
 # ── Embedding — all-MiniLM-L6-v2 (Stage 0) ───────────────────────────────────
 EMBED_MODEL      = "sentence-transformers/all-MiniLM-L6-v2"

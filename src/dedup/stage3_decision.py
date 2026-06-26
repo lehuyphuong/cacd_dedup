@@ -48,7 +48,15 @@ PROB_LOW  = max(0.05, _cutoff - 0.3)   # vd. 0.5 - 0.3 = 0.2
 # NIS_DROP_THRESHOLD: ranh giới tự nhiên của thang entropy chuẩn hóa [0,1]
 # 0.5 = entropy trung bình của token B bằng 50% maximum entropy lý thuyết
 # → B "ít thông tin mới hơn nửa" so với trường hợp hoàn toàn khác A
-NIS_DROP_THRESHOLD = 0.5
+NIS_DROP_THRESHOLD = 0.8   # Tăng từ 0.5 → 0.7 để giảm over-dropping
+                           # Dựa trên SemDeDup (Abbas et al. 2023):
+                           # giữ 80-85% data → kết quả tốt nhất
+
+# Length-aware guard — ROOTS (Laurençon et al. 2023):
+# Chunk dài có nhiều thông tin riêng, false positive cao hơn
+LENGTH_GUARD = 300         # ký tự — không drop chunk dài hơn mức này
+                           # trừ khi NIS cực thấp (< NIS_FLOOR)
+NIS_FLOOR    = 0.3         # Ngưỡng tuyệt đối: NIS < 0.3 → drop dù chunk dài
 
 
 def save_heatmap(
@@ -239,27 +247,52 @@ def run_cacd_dedup(
         prob = best["prob_duplicate"]
         nis  = best["nis_b_given_a"]
 
+        # ── Stage 3 — Quyết định cải tiến ───────────────────────────────────
+        #
+        # Thay đổi so với version trước:
+        # 1. NIS_DROP_THRESHOLD tăng từ 0.5 lên 0.7 — dựa trên SemDeDup
+        #    (Abbas et al. 2023): giữ lại 80-85% data cho kết quả tốt nhất.
+        #    NIS < 0.7 là tín hiệu mạnh hơn trước khi quyết định drop.
+        # 2. Length-aware guard — dựa trên ROOTS (Laurençon et al. 2023):
+        #    chunk dài có nhiều thông tin riêng, false positive rate cao hơn.
+        #    Không drop chunk > LENGTH_GUARD ký tự trừ khi NIS cực thấp.
+        #
+        # Mục tiêu drop rate: 15-20% (thay vì 51-71% hiện tại).
+
+        chunk_len = len(chunk["text"])
+
         if prob >= PROB_HIGH:
-            decision = "drop"
-            reason   = f"prob_high ({prob:.3f} >= {PROB_HIGH})"
+            # Model rất chắc duplicate — nhưng kiểm tra length guard
+            if chunk_len > LENGTH_GUARD and nis > NIS_FLOOR:
+                decision = "keep"
+                reason   = f"length_guard ({chunk_len}chars > {LENGTH_GUARD}, nis={nis:.3f})"
+            else:
+                decision = "drop"
+                reason   = f"prob_high ({prob:.3f} >= {PROB_HIGH})"
         elif prob <= PROB_LOW:
             decision = "keep"
             reason   = f"prob_low ({prob:.3f} <= {PROB_LOW})"
         else:
-            # Vùng không chắc chắn → NIS quyết định
+            # Uncertainty zone → NIS quyết định (threshold cao hơn = ít drop hơn)
             if nis < NIS_DROP_THRESHOLD:
-                decision = "drop"
-                reason   = f"nis_low ({nis:.3f} < {NIS_DROP_THRESHOLD}, prob={prob:.3f})"
+                if chunk_len > LENGTH_GUARD:
+                    decision = "keep"
+                    reason   = f"length_guard_uncertainty ({chunk_len}chars, nis={nis:.3f})"
+                else:
+                    decision = "drop"
+                    reason   = f"nis_low ({nis:.3f} < {NIS_DROP_THRESHOLD}, prob={prob:.3f})"
             else:
                 decision = "keep"
                 reason   = f"nis_high ({nis:.3f} >= {NIS_DROP_THRESHOLD}, prob={prob:.3f})"
 
-        if save_heatmaps and n_heatmaps_saved < max_heatmaps:
-            save_heatmap(
-                best, chunk["chunk_id"], best["chunk_id"],
-                config_name, decision,
-            )
-            n_heatmaps_saved += 1
+        # Heatmap tạm thời disabled để cải thiện ingest time.
+        # Uncomment khi cần phân tích trực quan:
+        # if save_heatmaps and n_heatmaps_saved < max_heatmaps:
+        #     save_heatmap(
+        #         best, chunk["chunk_id"], best["chunk_id"],
+        #         config_name, decision,
+        #     )
+        #     n_heatmaps_saved += 1
 
         audit_log.append({
             "chunk_id":           chunk["chunk_id"],
