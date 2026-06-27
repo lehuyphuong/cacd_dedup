@@ -107,13 +107,13 @@ def _make_configs() -> list[dict]:
         {"strategy": "FixedSize",   "chunk_size": 400, "overlap": 0},
 
         # ── Recursive ≡ RecursiveToken (paper chunk_size=200,400) ────────────
-        {"strategy": "RecursiveToken",   "chunk_size": 200, "overlap": 0},
-        {"strategy": "RecursiveToken",   "chunk_size": 400, "overlap": 0},
+        {"strategy": "Recursive",   "chunk_size": 200, "overlap": 0},
+        {"strategy": "Recursive",   "chunk_size": 400, "overlap": 0},
 
         # ── Semantic ≡ ClusterSemantic (paper chunk_size=200,400) ─────────────
-        {"strategy": "ClusterSemantic",    "chunk_size": 200, "overlap": 0,
+        {"strategy": "Semantic",    "chunk_size": 200, "overlap": 0,
          "extra": {"threshold_percentile": 95.0}},
-        {"strategy": "ClusterSemantic",    "chunk_size": 400, "overlap": 0,
+        {"strategy": "Semantic",    "chunk_size": 400, "overlap": 0,
          "extra": {"threshold_percentile": 95.0}},
 
         # ── Overlapping (paper chunk_size=400/overlap=200, 800/overlap=400) ──
