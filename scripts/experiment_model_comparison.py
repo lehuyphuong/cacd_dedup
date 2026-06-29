@@ -1,17 +1,17 @@
 """
 scripts/experiment_model_comparison.py
 
-So sánh 37 cross-encoder models trên 5 cặp chunk với mức độ tương đồng
-khác nhau. Mỗi model chạy độc lập, output heatmap + bảng số liệu.
+Compares 37 cross-encoder models on 5 chunk pairs with varying similarity.
+Each model runs independently; outputs a heatmap and score table per model.
 
-Chạy từ thư mục gốc cacd-dedup:
+Run from the project root:
   python scripts/experiment_model_comparison.py
 
 Output:
   results/model_comparison/{model_slug}/case1_identical.png
   results/model_comparison/{model_slug}/case2_paraphrase_full.png
   ...
-  results/model_comparison/summary.csv   ← bảng tổng hợp tất cả models
+  results/model_comparison/summary.csv   -- aggregated table across all models
 """
 
 from __future__ import annotations
@@ -75,42 +75,42 @@ MODELS = [
     "cross-encoder/stsb-roberta-base",
 ]
 
-# ── 5 cặp chunk thực nghiệm ───────────────────────────────────────────────────
+# ── 5 experimental chunk pairs ────────────────────────────────────────────────
 
 PAIRS = {
     "case1_identical": {
-        "label": "Case 1 — 2 câu y hệt nhau (100% identical)",
+        "label": "Case 1 — identical sentences (100% identical)",
         "a": "The Eiffel Tower was built in 1889 in Paris, France.",
         "b": "The Eiffel Tower was built in 1889 in Paris, France.",
         "expected": "DROP",
     },
     "case2_paraphrase_full": {
-        "label": "Case 2 — 2 câu giống nhau nhưng khác cách viết (100% paraphrase)",
+        "label": "Case 2 — same meaning, different wording (100% paraphrase)",
         "a": "The Eiffel Tower was built in 1889 in Paris, France.",
         "b": "France's iconic Eiffel Tower was constructed in the year 1889 in the city of Paris.",
         "expected": "DROP",
     },
     "case3_identical_50pct": {
-        "label": "Case 3 — 2 câu y hệt 50% (shared first half, different second half)",
+        "label": "Case 3 — 50% identical (shared first half, different second half)",
         "a": "The Eiffel Tower was built in 1889 in Paris, France. It attracts millions of tourists every year.",
         "b": "The Eiffel Tower was built in 1889 in Paris, France. It was designed by the engineer Gustave Eiffel.",
         "expected": "KEEP",
     },
     "case4_paraphrase_50pct": {
-        "label": "Case 4 — 2 câu giống nhau ~50% nhưng khác cách viết (paraphrase + new info)",
+        "label": "Case 4 — ~50% overlap with paraphrase + new information",
         "a": "The Eiffel Tower was built in 1889 in Paris, France. It attracts millions of tourists every year.",
         "b": "France's iconic tower was constructed in 1889 in Paris. It was designed by the engineer Gustave Eiffel.",
         "expected": "KEEP",
     },
     "case5_different": {
-        "label": "Case 5 — 2 câu khác nhau hoàn toàn",
+        "label": "Case 5 — completely different sentences",
         "a": "The Eiffel Tower was built in 1889 in Paris, France.",
         "b": "The Amazon rainforest covers over 5.5 million square kilometers in South America.",
         "expected": "KEEP",
     },
 }
 
-# Ground-truth: case1 & case2 nên DROP, case3-5 nên KEEP
+# Ground-truth: case1 & case2 => DROP, case3-5 => KEEP
 EXPECTED = {k: v["expected"] for k, v in PAIRS.items()}
 
 # ── Scoring ───────────────────────────────────────────────────────────────────
@@ -128,17 +128,17 @@ def score_pair(text_a: str, text_b: str, tokenizer, model) -> dict:
         outputs = model(**inputs)
 
     raw_logit = outputs.logits.squeeze()
-    # Xử lý cả trường hợp multi-label (NLI có 3 class: contradiction/neutral/entailment)
+    # Handle both binary models (scalar logit) and multi-class models
+    # (NLI: 3 classes — contradiction / neutral / entailment)
     if raw_logit.dim() == 0:
         scalar_logit = raw_logit.item()
         prob_dup = float(torch.sigmoid(raw_logit).item())
     else:
-        # Lấy logit của class cuối (thường là entailment/match/duplicate)
+        # Last class is typically entailment / match / duplicate
         scalar_logit = raw_logit[-1].item()
         probs = torch.softmax(raw_logit, dim=-1)
         prob_dup = float(probs[-1].item())
 
-    # Attention (nếu có)
     cov_a2b, cov_b2a, entropy_val = 0.0, 0.0, 1.0
     attn_matrix = None
     tokens_a_list, tokens_b_list = [], []
@@ -148,13 +148,13 @@ def score_pair(text_a: str, text_b: str, tokenizer, model) -> dict:
         last_attn = outputs.attentions[-1][0]
         avg_attn  = last_attn.mean(dim=0)
 
-        input_ids  = inputs["input_ids"][0]
-        all_tokens = tokenizer.convert_ids_to_tokens(input_ids)
+        input_ids    = inputs["input_ids"][0]
+        all_tokens   = tokenizer.convert_ids_to_tokens(input_ids)
         n_tokens_val = int(inputs["attention_mask"][0].sum().item())
 
-        sep_id = tokenizer.sep_token_id
+        sep_id        = tokenizer.sep_token_id
         sep_positions = (input_ids == sep_id).nonzero(as_tuple=True)[0]
-        sep_idx_val = int(sep_positions[0].item()) if len(sep_positions) > 0 else n_tokens_val // 2
+        sep_idx_val   = int(sep_positions[0].item()) if len(sep_positions) > 0 else n_tokens_val // 2
 
         a_range = slice(1, sep_idx_val)
         b_range = slice(sep_idx_val + 1, n_tokens_val - 1)
@@ -166,35 +166,35 @@ def score_pair(text_a: str, text_b: str, tokenizer, model) -> dict:
         if sub_b2a.numel() > 0:
             cov_b2a = sub_b2a.max(dim=1).values.mean().item()
         if sub_a2b.numel() > 0:
-            probs_ent  = sub_a2b / (sub_a2b.sum(dim=1, keepdim=True) + 1e-9)
-            ent        = -(probs_ent * torch.log(probs_ent + 1e-9)).sum(dim=1)
-            max_ent    = math.log(max(sub_a2b.shape[1], 2))
+            probs_ent   = sub_a2b / (sub_a2b.sum(dim=1, keepdim=True) + 1e-9)
+            ent         = -(probs_ent * torch.log(probs_ent + 1e-9)).sum(dim=1)
+            max_ent     = math.log(max(sub_a2b.shape[1], 2))
             entropy_val = float((ent / max_ent).mean().item())
 
-        attn_matrix    = avg_attn[:n_tokens_val, :n_tokens_val].cpu().numpy()
-        tokens_a_list  = all_tokens[1:sep_idx_val]
-        tokens_b_list  = all_tokens[sep_idx_val + 1:n_tokens_val - 1]
+        attn_matrix   = avg_attn[:n_tokens_val, :n_tokens_val].cpu().numpy()
+        tokens_a_list = all_tokens[1:sep_idx_val]
+        tokens_b_list = all_tokens[sep_idx_val + 1:n_tokens_val - 1]
 
     return {
-        "raw_logit":        round(scalar_logit, 4),
-        "prob_duplicate":   round(prob_dup, 4),
-        "coverage_a_to_b":  round(cov_a2b, 4),
-        "coverage_b_to_a":  round(cov_b2a, 4),
+        "raw_logit":         round(scalar_logit, 4),
+        "prob_duplicate":    round(prob_dup, 4),
+        "coverage_a_to_b":   round(cov_a2b, 4),
+        "coverage_b_to_a":   round(cov_b2a, 4),
         "redundancy_signal": round(min(cov_a2b, cov_b2a), 4),
-        "attn_entropy":     round(entropy_val, 4),
-        "attention_matrix": attn_matrix,
-        "tokens_a":         tokens_a_list,
-        "tokens_b":         tokens_b_list,
-        "sep_idx":          sep_idx_val,
-        "n_tokens":         n_tokens_val,
+        "attn_entropy":      round(entropy_val, 4),
+        "attention_matrix":  attn_matrix,
+        "tokens_a":          tokens_a_list,
+        "tokens_b":          tokens_b_list,
+        "sep_idx":           sep_idx_val,
+        "n_tokens":          n_tokens_val,
     }
 
 
 def decide(result: dict) -> str:
     """
-    Quyết định dựa trên raw_logit với ngưỡng tự nhiên logit=0.
-    Với model binary (quora, stsb): logit > 0  → DROP.
-    Với model NLI 3-class: prob_duplicate > 0.5 → DROP.
+    Decision based on prob_duplicate with natural threshold at 0.5.
+    Binary models (quora, stsb): sigmoid(logit) > 0.5 => DROP.
+    NLI 3-class models: softmax[-1] > 0.5 => DROP.
     """
     if result["prob_duplicate"] > 0.5:
         return "DROP"
@@ -234,14 +234,14 @@ def plot_heatmap(result: dict, case_key: str, case_label: str,
     ax.set_yticks(range(len(tokens_a)))
     ax.set_yticklabels(tokens_a, fontsize=7)
     ax.set_xlabel("Candidate (B)", fontsize=9)
-    ax.set_ylabel("Chunk mới (A)", fontsize=9)
+    ax.set_ylabel("New chunk (A)", fontsize=9)
 
-    correct = "✓" if decision == expected else "✗"
+    correct = "pass" if decision == expected else "fail"
     title = (
         f"{case_label}\n"
         f"model={model_slug}\n"
         f"logit={result['raw_logit']:.3f}  prob_dup={result['prob_duplicate']:.3f}  "
-        f"cov(A→B)={result['coverage_a_to_b']:.4f}  cov(B→A)={result['coverage_b_to_a']:.4f}\n"
+        f"cov(A=>B)={result['coverage_a_to_b']:.4f}  cov(B=>A)={result['coverage_b_to_a']:.4f}\n"
         f"decision={decision}  expected={expected}  {correct}"
     )
     ax.set_title(title, fontsize=7, pad=8)
@@ -266,15 +266,15 @@ def run_model(model_name: str, summary_rows: list) -> None:
     print(f"{'='*70}")
 
     try:
-        t_load = time.perf_counter()
+        t_load    = time.perf_counter()
         tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModelForSequenceClassification.from_pretrained(
+        model     = AutoModelForSequenceClassification.from_pretrained(
             model_name, output_attentions=True
         )
         model.to(DEVICE)
         model.eval()
         load_time = round(time.perf_counter() - t_load, 1)
-        n_params   = sum(p.numel() for p in model.parameters()) / 1e6
+        n_params  = sum(p.numel() for p in model.parameters()) / 1e6
         print(f"  Loaded in {load_time}s | params={n_params:.0f}M | device={DEVICE}")
     except Exception as e:
         print(f"  [SKIP] Failed to load: {e}")
@@ -302,7 +302,7 @@ def run_model(model_name: str, summary_rows: list) -> None:
                 f"  {case_key:<30} logit={result['raw_logit']:>8.3f}  "
                 f"prob_dup={result['prob_duplicate']:.3f}  "
                 f"redund={result['redundancy_signal']:.4f}  "
-                f"→ {decision:<4}  ({'✓' if correct else '✗'} expected {expected})"
+                f"=> {decision:<4}  ({'pass' if correct else 'fail'} expected {expected})"
             )
 
             plot_heatmap(result, case_key, pair["label"],
@@ -330,9 +330,9 @@ def run_model(model_name: str, summary_rows: list) -> None:
                 "decision": "", "expected": EXPECTED[case_key], "correct": "0",
             })
 
-    print(f"  → Accuracy: {n_correct}/5 correct")
+    print(f"  => Accuracy: {n_correct}/5 correct")
 
-    # Giải phóng VRAM/RAM trước khi load model tiếp theo
+    # Release VRAM/RAM before loading the next model
     del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -341,7 +341,7 @@ def run_model(model_name: str, summary_rows: list) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    print(f"CACD — Model Comparison Experiment")
+    print("CACD — Model Comparison Experiment")
     print(f"Device: {DEVICE} | Models: {len(MODELS)} | Cases: {len(PAIRS)}")
     print(f"Output: {OUT_DIR.resolve()}")
 
@@ -351,7 +351,7 @@ def main():
         print(f"\n[{i}/{len(MODELS)}]", end="")
         run_model(model_name, summary_rows)
 
-    # Ghi summary CSV
+    # Write summary CSV
     csv_path = OUT_DIR / "summary.csv"
     fields = ["model", "case", "status", "raw_logit", "prob_dup",
               "cov_a2b", "cov_b2a", "redundancy", "decision", "expected", "correct"]
@@ -360,7 +360,6 @@ def main():
         writer.writeheader()
         writer.writerows(summary_rows)
 
-    # Accuracy per model (in-terminal summary)
     print(f"\n{'='*70}")
     print("FINAL SUMMARY — Accuracy per model (5 cases, expected: case1&2=DROP, case3-5=KEEP)")
     print(f"{'='*70}")
@@ -374,8 +373,7 @@ def main():
             model_acc[row["model"]].append(int(row["correct"]))
 
     for model_name, scores in model_acc.items():
-        acc = sum(scores) / len(scores) if scores else 0
-        bar = "█" * sum(scores) + "░" * (5 - sum(scores))
+        bar = "X" * sum(scores) + "." * (5 - sum(scores))
         print(f"  {model_name:<53} {bar}  {sum(scores)}/5")
 
     print(f"\nSummary CSV: {csv_path}")

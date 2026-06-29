@@ -1,18 +1,27 @@
 """
 CACD Stage 1 — Coarse Retrieval (bi-encoder + HNSW).
 
-Pipeline doc Section 4.1, "Đóng góp 1":
-  Batch query Qdrant với toàn bộ m vector của document cùng lúc,
-  lấy top-K ứng viên gần nhất cho mỗi chunk (K nhỏ, cố định).
+Role: narrow the candidate set from n (full index) down to K (small constant)
+so that Stage 2 (cross-encoder, expensive) only processes K candidates
+instead of all n chunks.
 
-Độ phức tạp: O(m log n) — không đổi về Big-O so với HNSW thuần túy.
-Vai trò: thu hẹp candidate set từ n (toàn bộ index) xuống K (hằng số
-nhỏ), để Stage 2 (cross-attention, đắt) chỉ cần xử lý K ứng viên
-thay vì toàn bộ n.
+Algorithm:
+  Batch-query Qdrant with all m vectors of the current document in a single
+  request, retrieving the top-K nearest neighbours for each chunk.
 
-Không dùng GPU song song hóa thật trong bản triển khai này (CPU-only
-môi trường), nhưng kiến trúc batch-query vẫn được giữ nguyên — đây
-là điểm có thể nâng cấp lên cuVS/FAISS-GPU sau này mà không đổi logic.
+Complexity: O(m log n) — same Big-O as plain HNSW.
+
+Input:
+  chunks     : list of chunk dicts (not yet inserted into Qdrant).
+  dense_vecs : pre-computed embeddings for each chunk.
+  cname      : Qdrant collection name (may already contain chunks from
+               earlier iterations of the same ingest pass).
+  top_k      : number of candidates to retrieve per chunk.
+
+Output:
+  (candidates_per_chunk, elapsed_seconds)
+  candidates_per_chunk[i] = list of candidate dicts already in the index
+                            that are nearest to chunks[i].
 """
 
 from __future__ import annotations
@@ -35,35 +44,34 @@ def batch_coarse_retrieve(
     top_k: int | None = None,
 ) -> tuple[list[list[dict]], float]:
     """
-    Với mỗi chunk mới (đã có embedding sẵn), tìm top-K ứng viên gần
-    nhất ĐÃ TỒN TẠI trong collection Qdrant (persistent index, không
-    phải chỉ so sánh nội bộ batch).
+    For each new chunk (embedding pre-computed), find the top-K nearest
+    neighbours already present in the Qdrant collection (persistent index,
+    not just the current batch).
 
     Args:
-        chunks    : list chunk dict (chưa insert vào Qdrant).
-        dense_vecs: embedding tương ứng từng chunk (đã tính sẵn).
-        cname     : tên collection Qdrant đang ingest dần (đã có thể
-                    chứa chunk từ các batch trước).
-        top_k     : K ứng viên gần nhất lấy ra cho mỗi chunk. None =
-                    dùng CACD_TOP_K_CANDIDATES từ settings.
+        chunks    : list of chunk dicts (not yet inserted into Qdrant).
+        dense_vecs: embeddings corresponding to each chunk.
+        cname     : Qdrant collection being ingested incrementally (may
+                    already contain chunks from previous iterations).
+        top_k     : K nearest neighbours per chunk.
+                    None => use CACD_TOP_K_CANDIDATES from settings.
 
     Returns:
         (candidates_per_chunk, elapsed_seconds)
-        candidates_per_chunk[i] = list các candidate dict (đã có sẵn
-        trong index) ứng với chunks[i], rỗng nếu collection chưa có
-        điểm nào hoặc không tìm thấy candidate nào.
+        candidates_per_chunk[i]: candidate dicts already in the index
+                                 for chunks[i]; empty list if the
+                                 collection has no points yet.
     """
     if top_k is None:
         top_k = CACD_TOP_K_CANDIDATES
 
     client = get_client()
-    t0 = time.perf_counter()
+    t0     = time.perf_counter()
 
     candidates_per_chunk: list[list[dict]] = []
 
-    # Batch query — gửi toàn bộ m vector cùng lúc trong 1 request.
-    # Qdrant xử lý từng vector độc lập trên cùng 1 graph HNSW cố định
-    # (đã build từ các lần insert trước đó).
+    # Batch query — send all m vectors in a single request.
+    # Qdrant processes each vector independently on the same fixed HNSW graph.
     try:
         requests = [
             QueryRequest(query=vec, limit=top_k, with_payload=True)
@@ -74,8 +82,8 @@ def batch_coarse_retrieve(
             requests=requests,
         )
     except Exception as exc:
-        # Collection rỗng hoặc chưa tồn tại — không có gì để so sánh.
-        logger.debug("Coarse retrieve: collection trống hoặc lỗi (%s)", exc)
+        # Empty collection or collection does not exist yet.
+        logger.debug("Coarse retrieve: empty collection or error (%s)", exc)
         results = [None] * len(dense_vecs)
 
     for batch_result in results:
@@ -83,7 +91,7 @@ def batch_coarse_retrieve(
             candidates_per_chunk.append([])
             continue
         points = getattr(batch_result, "points", batch_result)
-        cands = []
+        cands  = []
         for hit in points:
             payload = hit.payload or {}
             cands.append({
@@ -97,10 +105,10 @@ def batch_coarse_retrieve(
             })
         candidates_per_chunk.append(cands)
 
-    elapsed = time.perf_counter() - t0
-    n_with_candidates = sum(1 for c in candidates_per_chunk if c)
+    elapsed            = time.perf_counter() - t0
+    n_with_candidates  = sum(1 for c in candidates_per_chunk if c)
     logger.debug(
-        "  Stage1 coarse retrieve: %d/%d chunks có candidate (top_k=%d) trong %.2fs",
+        "  Stage1 coarse retrieve: %d/%d chunks have candidates (top_k=%d) in %.2fs",
         n_with_candidates, len(chunks), top_k, elapsed,
     )
     return candidates_per_chunk, elapsed

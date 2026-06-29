@@ -7,6 +7,13 @@ Questions are used only at evaluation time.
 Returns:
     documents : list[{doc_id, title, text}]
     qa_pairs  : list[{question, answers, doc_id, title}]
+
+Note on dynamic settings override:
+  MAX_DOCUMENTS and MAX_EVAL_QUESTIONS are read via `settings.XXX` (module
+  reference) rather than `from configs.settings import XXX` (value copy).
+  This allows benchmark.py to override them after import via CLI flags
+  (--max-docs / --max-questions); a `from X import Y` copy at import time
+  would not reflect subsequent assignments to the module attribute.
 """
 
 from __future__ import annotations
@@ -31,23 +38,16 @@ def load_squad() -> tuple[list[dict], list[dict]]:
 
     documents : unique context passages, deduplicated by content hash.
     qa_pairs  : question + ground-truth answers + doc_id reference.
-
-    Đọc MAX_DOCUMENTS / MAX_EVAL_QUESTIONS qua `settings.XXX` (không
-    phải `from configs.settings import XXX`), để benchmark.py có thể
-    override các giá trị này từ CLI (--max-docs/--max-questions) SAU
-    khi module này đã được import — Python "from X import Y" copy giá
-    trị tại thời điểm import, không tham chiếu động, nên override sau
-    đó sẽ không có tác dụng nếu dùng cú pháp import cũ.
     """
     logger.info("Loading %s / %s ...", settings.DATASET_NAME, settings.DATASET_SPLIT)
     ds = load_dataset(settings.DATASET_NAME, split=settings.DATASET_SPLIT)
 
     seen_docs: dict[str, dict] = {}
-    qa_pairs: list[dict] = []
+    qa_pairs:  list[dict]      = []
 
     for row in ds:
         context = row["context"].strip()
-        did = _doc_id(context)
+        did     = _doc_id(context)
 
         if did not in seen_docs:
             seen_docs[did] = {
@@ -69,8 +69,8 @@ def load_squad() -> tuple[list[dict], list[dict]]:
 
     if settings.MAX_DOCUMENTS is not None:
         documents = documents[:settings.MAX_DOCUMENTS]
-        kept_ids = {d["doc_id"] for d in documents}
-        qa_pairs = [q for q in qa_pairs if q["doc_id"] in kept_ids]
+        kept_ids  = {d["doc_id"] for d in documents}
+        qa_pairs  = [q for q in qa_pairs if q["doc_id"] in kept_ids]
 
     if settings.MAX_EVAL_QUESTIONS is not None:
         qa_pairs = qa_pairs[:settings.MAX_EVAL_QUESTIONS]

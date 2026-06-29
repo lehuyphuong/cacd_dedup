@@ -1,30 +1,28 @@
 """
 Central configuration for cacd-dedup.
 
-Một project độc lập, tách riêng khỏi rag-bench-v4. Giữ nguyên 5
-chunking strategies từ v4 để đánh giá, nhưng thay toàn bộ 5 filter
-methods cũ (NoFilter/ExactNorm/MinHashLSH/Similarity/NERExact) bằng
-một pipeline duy nhất: CACD (Cross-Attention Calibrated Deduplication).
+A standalone project, separated from rag-bench-v4. Retains the same 9
+chunking strategies for evaluation, but replaces all 5 filter methods
+(NoFilter/ExactNorm/MinHashLSH/Similarity/NERExact) with a single
+pipeline: CACD (Cross-Attention Calibrated Deduplication).
 
-CACD pipeline (4 stages, chỉ nhánh DROP — không Merge):
+CACD pipeline (4 stages, DROP branch only — Merge reserved for future work):
   Stage 0: Embedding          — all-MiniLM-L6-v2, 384-dim
   Stage 1: Coarse retrieval   — batch query Qdrant (HNSW), top-K candidates
-  Stage 2: Cross-attention    — cross-encoder/ms-marco-MiniLM-L-6-v2,
-                                 trích attention matrix, tính redundancy
-                                 signal (max-alignment coverage)
-  Stage 3: Decision           — calibrated probability + Bayes-optimal
-                                 cutoff, chỉ nhánh DROP (Merge để dành
-                                 cho experiment sau)
+  Stage 2: Cross-attention    — cross-encoder/msmarco-MiniLM-L6-en-de-v1,
+                                 extract attention matrix, compute NIS
+  Stage 3: Decision           — 3-zone logic using prob_duplicate + NIS
+                                 + length-aware guard
 
-Evaluation metrics: giữ nguyên 4 metrics cũ từ v4 — Precision, Recall,
-IoU, Index Size (chunk count + storage MB).
+Evaluation metrics: same 4 metrics as rag-bench-v4 —
+  Precision, Recall, IoU, Index Size (chunk count + storage MB).
 """
 
 from pathlib import Path
 
 import torch
 
-# ── Paths ────────────────────────────────────────────────────────────────────
+# ── Paths ─────────────────────────────────────────────────────────────────────
 ROOT_DIR     = Path(__file__).resolve().parent.parent
 DATA_DIR     = ROOT_DIR / "data"
 RESULTS_DIR  = ROOT_DIR / "results"
@@ -36,7 +34,7 @@ RESULTS_DIR.mkdir(exist_ok=True)
 QDRANT_PATH.mkdir(exist_ok=True)
 HEATMAP_DIR.mkdir(exist_ok=True)
 
-# ── Dataset ──────────────────────────────────────────────────────────────────
+# ── Dataset ───────────────────────────────────────────────────────────────────
 DATASET_NAME       = "rajpurkar/squad"
 DATASET_SPLIT      = "validation"
 # MAX_DOCUMENTS:       int | None = 500
@@ -44,41 +42,42 @@ DATASET_SPLIT      = "validation"
 
 MAX_DOCUMENTS:       int | None = None
 MAX_EVAL_QUESTIONS:  int | None = None
+
 # ── Embedding — all-MiniLM-L6-v2 (Stage 0) ───────────────────────────────────
 EMBED_MODEL      = "sentence-transformers/all-MiniLM-L6-v2"
 TEXT_EMBED_DIM   = 384
-# Batch size lớn hơn tận dụng GPU tốt hơn.
-# GPU 8GB+: 512–1024. CPU: giữ 128.
+# Larger batch size improves GPU utilisation.
+# GPU 8GB+: 512-1024. CPU: keep at 128.
 EMBED_BATCH_SIZE = 512 if torch.cuda.is_available() else 128
 
 # ── CACD — Stage 1 (Coarse retrieval) ────────────────────────────────────────
-CACD_TOP_K_CANDIDATES = 5   # K ứng viên gần nhất lấy ra từ HNSW mỗi chunk
+CACD_TOP_K_CANDIDATES = 5   # top-K nearest neighbours retrieved from HNSW per chunk
 
 # ── CACD — Stage 2 (Cross-attention) ─────────────────────────────────────────
-# Pretrained, KHÔNG fine-tune (theo quyết định của user). Model được chọn
-# dựa trên kết quả research: cross-encoder/msmarco-MiniLM-L6-en-de-v1 là
-# baseline phổ biến nhất trong literature (AugSBERT, nhiều paper rerank).
+# Pretrained, no fine-tuning. Selected after a 37-model comparison experiment;
+# cross-encoder/msmarco-MiniLM-L6-en-de-v1 is the most commonly used baseline
+# in the reranking literature (AugSBERT and related work).
 CACD_CROSS_ENCODER_MODEL = "cross-encoder/msmarco-MiniLM-L6-en-de-v1"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ── CACD — Stage 3 (Decision: Bayes-optimal cutoff) ──────────────────────────
 # cutoff = cost_FP / (cost_FP + cost_FN)
-#   cost_FP: chi phí khi NHẦM drop 1 chunk thật sự không trùng (mất thông tin)
-#   cost_FN: chi phí khi NHẦM giữ 1 chunk thật sự trùng lặp (lãng phí storage)
+#   cost_FP: cost of incorrectly dropping a non-duplicate chunk (information loss)
+#   cost_FN: cost of incorrectly keeping a duplicate chunk (wasted index space)
 #
-# Mặc định đối xứng (cutoff=0.5). Tăng CACD_COST_FALSE_POSITIVE để hệ thống
-# THẬN TRỌNG hơn khi drop (ưu tiên không mất thông tin hơn ưu tiên gọn nhẹ).
+# Default is symmetric (cutoff = 0.5). Increase CACD_COST_FALSE_POSITIVE to
+# make the system more conservative when dropping (prefer recall over precision).
 CACD_COST_FALSE_POSITIVE = 1.0
 CACD_COST_FALSE_NEGATIVE = 1.0
 
-# ── Vector store — Qdrant (embedded, no Docker) ──────────────────────────────
+# ── Vector store — Qdrant (embedded, no Docker) ───────────────────────────────
 COLLECTION_PREFIX = "cacd_dedup"
 
-# ── Retrieval (đánh giá cuối, top-k = 5 như v4) ──────────────────────────────
+# ── Retrieval (final evaluation, top-k = 5 matching rag-bench-v4) ─────────────
 TOP_K = 5
 
-# ── LLM (Ollama — optional, không dùng trong scope hiện tại) ────────────────
+# ── LLM (Ollama — optional, not used in current scope) ───────────────────────
 OLLAMA_BASE_URL = "http://localhost:11434"
 LLM_MODEL       = "mistral"
 LLM_TEMPERATURE = 0.0
@@ -90,57 +89,57 @@ ONLY the provided context passages. Be concise — answer in 1-3 sentences. \
 If the answer is not in the context, respond with exactly: "I don't know."\
 """
 
-# ── Chunking configurations (giữ nguyên 5 strategies từ v4) ─────────────────
+# ── Chunking configurations ───────────────────────────────────────────────────
 #
-# 10 chunking configs × 1 pipeline CACD = 10 configs tổng
+# 18 chunking configs × 1 CACD pipeline = 18 total configs
 #
 # Strategy params:
 #   chunk_size : target chunk size in characters (base unit)
 #   overlap    : character overlap between chunks (0 for strategies that
-#                don't use sliding windows)
+#                do not use sliding windows)
 #   extra      : strategy-specific overrides (optional)
 
 def _make_configs() -> list[dict]:
     chunker_configs = [
-        # ── FixedSize ≡ FixedToken (paper chunk_size=200,400) ───────────────
+        # ── FixedSize == FixedToken (paper chunk_size=200,400) ────────────────
         {"strategy": "FixedSize",   "chunk_size": 200, "overlap": 0},
         {"strategy": "FixedSize",   "chunk_size": 400, "overlap": 0},
 
-        # ── Recursive ≡ RecursiveToken (paper chunk_size=200,400) ────────────
+        # ── Recursive == RecursiveToken (paper chunk_size=200,400) ────────────
         {"strategy": "Recursive",   "chunk_size": 200, "overlap": 0},
         {"strategy": "Recursive",   "chunk_size": 400, "overlap": 0},
 
-        # ── Semantic ≡ ClusterSemantic (paper chunk_size=200,400) ─────────────
+        # ── Semantic == ClusterSemantic (paper chunk_size=200,400) ────────────
         {"strategy": "Semantic",    "chunk_size": 200, "overlap": 0,
          "extra": {"threshold_percentile": 95.0}},
         {"strategy": "Semantic",    "chunk_size": 400, "overlap": 0,
          "extra": {"threshold_percentile": 95.0}},
 
-        # ── Overlapping (paper chunk_size=400/overlap=200, 800/overlap=400) ──
+        # ── Overlapping (paper chunk_size=400/overlap=200, 800/overlap=400) ───
         {"strategy": "Overlapping", "chunk_size": 400, "overlap": 200},
         {"strategy": "Overlapping", "chunk_size": 800, "overlap": 400},
 
-        # ── AdaptiveEntropy ─────────────────────────────────────────────────
+        # ── AdaptiveEntropy ───────────────────────────────────────────────────
         {"strategy": "AdaptiveEntropy",       "chunk_size": 300, "overlap": 0},
         {"strategy": "AdaptiveEntropy",       "chunk_size": 500, "overlap": 0},
 
-        # ── AdaptiveSentenceLen ──────────────────────────────────────────────
+        # ── AdaptiveSentenceLen ───────────────────────────────────────────────
         {"strategy": "AdaptiveSentenceLen",   "chunk_size": 4,   "overlap": 0,
          "extra": {"target_sentences": 4, "min_sentences": 2, "max_sentences": 8}},
         {"strategy": "AdaptiveSentenceLen",   "chunk_size": 6,   "overlap": 0,
          "extra": {"target_sentences": 6, "min_sentences": 3, "max_sentences": 12}},
 
-        # ── HierarchicalParentChild ──────────────────────────────────────────
+        # ── HierarchicalParentChild ───────────────────────────────────────────
         {"strategy": "HierarchicalParentChild", "chunk_size": 200, "overlap": 0,
          "extra": {"parent_size": 600}},
         {"strategy": "HierarchicalParentChild", "chunk_size": 400, "overlap": 0,
          "extra": {"parent_size": 800}},
 
-        # ── Contextual ───────────────────────────────────────────────────────
+        # ── Contextual ────────────────────────────────────────────────────────
         {"strategy": "Contextual",            "chunk_size": 300, "overlap": 0},
         {"strategy": "Contextual",            "chunk_size": 500, "overlap": 0},
 
-        # ── TopicBased ───────────────────────────────────────────────────────
+        # ── TopicBased ────────────────────────────────────────────────────────
         {"strategy": "TopicBased",            "chunk_size": 200, "overlap": 0,
          "extra": {"n_topics": 4, "min_chunk_size": 100}},
         {"strategy": "TopicBased",            "chunk_size": 400, "overlap": 0,

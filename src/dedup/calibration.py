@@ -1,33 +1,22 @@
 """
-CACD Stage 2d — Calibration: redundancy signal (từ attention coverage)
-→ calibrated probability P(duplicate | attention_pattern).
+CACD calibration — Bayes-optimal cutoff derivation.
 
-QUAN TRỌNG — lý do KHÔNG dùng raw_logit của cross-encoder trực tiếp:
-ms-marco-MiniLM-L-6-v2 được train cho RELEVANCE RANKING (MS MARCO
-passage ranking) — raw_logit cao nghĩa là "passage B liên quan tới
-query A", KHÔNG phải "A và B là bản sao của nhau". Hai chunk thuộc
-cùng một chủ đề (rất phổ biến trong cùng 1 document SQuAD) có thể có
-raw_logit rất cao dù nội dung hoàn toàn khác nhau. Dùng raw_logit trực
-tiếp làm tín hiệu dedup đã được quan sát thực nghiệm gây ra over-drop
-nghiêm trọng (77-90% chunk bị drop oan trên debug run đầu tiên).
+Role: derive the DROP/KEEP threshold from a cost ratio rather than
+a hand-picked constant (e.g. cosine threshold 0.8).
 
-Tín hiệu đúng bản chất hơn — được tính trong stage3_decision.py từ
-chính attention matrix (Stage 2b/2c, không cần thêm model khác):
-    redundancy_signal = min(coverage_a_to_b, coverage_b_to_a)
-Một cặp chỉ thực sự "trùng lặp" khi CẢ HAI chiều đều bao phủ nhau cao.
+Formula (Elkan, 2001 — binary classification with asymmetric costs):
+    cutoff = cost_FP / (cost_FP + cost_FN)
 
-Calibrator ở đây biến redundancy_signal thô (thường nằm trong khoảng
-nhỏ, 0.0-0.3 trên dữ liệu thực tế) thành một xác suất có ý nghĩa
-TƯƠNG ĐỐI trong chính phân phối dữ liệu đang chạy, qua z-score +
-sigmoid — không cần nhãn duplicate/not-duplicate có sẵn (online,
-không-tham-số-học).
+  cost_FP: cost of incorrectly dropping a non-duplicate chunk (information loss).
+  cost_FN: cost of incorrectly keeping a duplicate chunk (wasted index space).
 
-Đây KHÔNG phải calibration đã được chứng minh chính xác tuyệt đối
-(cần dữ liệu có nhãn để calibrate chuẩn — xem Desai & Durrett, EMNLP
-2020), nhưng giải quyết đúng vấn đề thực dụng: loại bỏ việc áp một
-threshold cố định tùy tiện (như cosine 0.8 trước đây) bằng một phép
-biến đổi có cơ sở thống kê tối thiểu, dựa trên phân phối dữ liệu
-thực tế thay vì một hằng số đoán mò.
+With symmetric costs (cost_FP = cost_FN = 1.0) => cutoff = 0.5, which coincides
+with the natural sigmoid threshold of the cross-encoder model.
+
+Note on RunningLogitCalibrator (retained for reference):
+  The z-score online calibrator was the original Stage 3 signal before NIS was
+  introduced. It is no longer used in the active decision path but is kept here
+  for comparison experiments.
 """
 
 from __future__ import annotations
@@ -41,19 +30,20 @@ logger = logging.getLogger(__name__)
 
 class RunningLogitCalibrator:
     """
-    Calibrator chạy động (online), tự cập nhật theo phân phối của tín
-    hiệu redundancy quan sát được qua quá trình ingest, dùng z-score +
-    sigmoid để biến tín hiệu thô thành xác suất P(duplicate) có ý nghĩa
-    tương đối trong chính phân phối dữ liệu hiện tại.
+    Online (streaming) calibrator that converts a raw redundancy signal into
+    a relative probability P(duplicate) using z-score normalisation + sigmoid.
 
-    Input là `redundancy_signal = min(coverage_a_to_b, coverage_b_to_a)`
-    (xem stage3_decision.py) — KHÔNG phải raw_logit của cross-encoder.
+    Input : redundancy_signal = min(coverage_a_to_b, coverage_b_to_a)
+    Output: float in [0, 1] — probability that the pair is a duplicate,
+            relative to the distribution of signals seen so far.
 
-    Đây thay thế cho threshold cố định: thay vì so tín hiệu với 1 hằng
-    số tuyệt đối, ta so nó với PHÂN PHỐI tín hiệu đã quan sát được —
-    một cặp được coi là "khả nghi cao" nếu redundancy_signal của nó nằm
-    ở phần đuôi cao của phân phối, bất kể domain/document cụ thể có
-    shift thang đo thế nào.
+    Formula:
+        z     = (signal - mean(observed)) / std(observed)
+        P_dup = sigmoid(z) = 1 / (1 + exp(-z))
+
+    This replaces a fixed absolute threshold with a distribution-relative
+    comparison: a pair is flagged only when its signal is in the high tail
+    of the observed distribution, regardless of domain-level scale shifts.
     """
 
     def __init__(self, min_samples: int = 30):
@@ -65,20 +55,18 @@ class RunningLogitCalibrator:
 
     def calibrated_probability(self, signal: float) -> float:
         """
-        P(duplicate) = sigmoid( z-score(signal) )
+        P(duplicate) = sigmoid(z-score(signal)).
 
-        Khi chưa có đủ dữ liệu để ước lượng phân phối (< 2 mẫu), trả
-        về 0.0 — trung lập, nghiêng về phía "giữ lại" (an toàn hơn so
-        với drop nhầm 1 chunk khi chưa biết gì về phân phối dữ liệu
-        đang xử lý).
+        Returns 0.0 when fewer than 2 samples have been observed
+        (neutral, biased toward KEEP to avoid premature drops).
         """
         if len(self._signals) < 2:
             return 0.0
 
-        arr = np.array(self._signals)
+        arr  = np.array(self._signals)
         mean = arr.mean()
-        std = arr.std() + 1e-6
-        z = (signal - mean) / std
+        std  = arr.std() + 1e-6
+        z    = (signal - mean) / std
         return float(1.0 / (1.0 + np.exp(-z)))
 
     def stats(self) -> dict:
@@ -94,21 +82,22 @@ class RunningLogitCalibrator:
 
 def bayes_optimal_cutoff(cost_false_positive: float, cost_false_negative: float) -> float:
     """
-    Stage 3 — suy ra cutoff từ tỷ lệ chi phí, KHÔNG phải số đoán mò.
+    Derive the decision cutoff from the cost ratio (Elkan, 2001).
 
-    cost_false_positive : chi phí khi NHẦM coi 1 chunk là duplicate
-                           rồi DROP nó (mất thông tin thật).
-    cost_false_negative : chi phí khi NHẦM coi 1 chunk KHÔNG phải
-                           duplicate rồi GIỮ nó (lãng phí index size).
+    Args:
+        cost_false_positive: cost of incorrectly dropping a non-duplicate
+                             chunk (information loss).
+        cost_false_negative: cost of incorrectly keeping a duplicate chunk
+                             (wasted index space).
 
-    Công thức Bayes-optimal cho bài toán phân loại nhị phân với chi
-    phí bất đối xứng (Elkan, 2001):
-        cutoff = cost_false_positive / (cost_false_positive + cost_false_negative)
+    Returns:
+        cutoff in (0, 1).
 
-    Khi 2 chi phí bằng nhau → cutoff = 0.5 (trường hợp đối xứng mặc định).
-    Khi việc DROP nhầm (mất thông tin) bị coi là tệ hơn nhiều so với
-    việc giữ thừa 1 chunk (lãng phí storage) → cost_false_positive cao
-    → cutoff cao hơn 0.5 → hệ thống THẬN TRỌNG hơn khi quyết định drop.
+    Formula:
+        cutoff = cost_FP / (cost_FP + cost_FN)
+
+    With equal costs => cutoff = 0.5 (symmetric default).
+    Higher cost_FP => cutoff > 0.5 => system is more conservative when dropping.
     """
     denom = cost_false_positive + cost_false_negative
     if denom <= 0:

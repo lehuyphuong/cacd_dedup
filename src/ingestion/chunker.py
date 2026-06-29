@@ -4,12 +4,12 @@ Chunking strategies — rag-bench v4.
 Five new strategies replacing the v3 Fixed/Recursive/ClusterSemantic set:
 
   AdaptiveEntropy      : chunk size adapts to local text entropy (Shannon H).
-                         High-entropy (information-dense) text → smaller chunks.
-                         Low-entropy (repetitive) text → larger chunks.
+                         High-entropy (information-dense) text => smaller chunks.
+                         Low-entropy (repetitive) text => larger chunks.
 
   AdaptiveSentenceLen  : chunk size adapts to mean sentence length in each
-                         sliding window. Short-sentence passages → finer chunks.
-                         Long-sentence passages → coarser chunks.
+                         sliding window. Short-sentence passages => finer chunks.
+                         Long-sentence passages => coarser chunks.
 
   HierarchicalParentChild : two-level chunking. Large "parent" chunks are split
                          into smaller "child" chunks. Both levels are indexed;
@@ -23,6 +23,13 @@ Five new strategies replacing the v3 Fixed/Recursive/ClusterSemantic set:
                          topic groups; consecutive sentences in the same cluster
                          are merged into one chunk. Chunk boundaries are placed
                          where the topic label changes.
+
+Classic strategies (v3-compatible, added for comparison):
+
+  FixedSize   : cut at a fixed character count, no sentence boundary awareness.
+  Recursive   : hierarchical split: paragraph => sentence => space => character.
+  Semantic    : sequential breakpoint detection via cosine distance percentile.
+  Overlapping : sliding window with mandatory overlap, split at word boundaries.
 
 Each chunker returns list[dict]:
   {
@@ -52,7 +59,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _sentence_split(text: str) -> list[str]:
     parts = re.split(r"(?<=[.!?])\s+", text.strip())
@@ -111,8 +118,8 @@ def adaptive_entropy_chunker(
       2. Compute entropy H of the window.
       3. Normalise H to [0,1] relative to the text's global entropy range.
       4. Target chunk size = lerp(max_size, min_size, normalised_H):
-           high entropy (dense info) → smaller chunks (closer to min_size)
-           low  entropy (repetitive) → larger  chunks (closer to max_size)
+           high entropy (dense info) => smaller chunks (closer to min_size)
+           low  entropy (repetitive) => larger  chunks (closer to max_size)
       5. Emit a chunk at the nearest sentence boundary to the target end.
     """
     text      = doc["text"]
@@ -120,16 +127,15 @@ def adaptive_entropy_chunker(
     if not sentences:
         return []
 
-    # Pre-compute per-sentence entropy
     sent_entropies = [_shannon_entropy(s) for s in sentences]
     global_min = min(sent_entropies) if sent_entropies else 0.0
     global_max = max(sent_entropies) if sent_entropies else 1.0
     h_range    = global_max - global_min or 1.0
 
-    chunks: list[dict] = []
-    buf_sents: list[str] = []
+    chunks:      list[dict] = []
+    buf_sents:   list[str]  = []
     buf_entropy: list[float] = []
-    cursor = 0
+    cursor    = 0
     chunk_idx = 0
 
     for sent, h in zip(sentences, sent_entropies):
@@ -137,7 +143,7 @@ def adaptive_entropy_chunker(
         buf_entropy.append(h)
 
         mean_h      = sum(buf_entropy) / len(buf_entropy)
-        norm_h      = (mean_h - global_min) / h_range          # 0 = low, 1 = high
+        norm_h      = (mean_h - global_min) / h_range      # 0 = low, 1 = high
         target_size = int(max_size - norm_h * (max_size - min_size))
 
         buf_text = " ".join(buf_sents)
@@ -148,12 +154,11 @@ def adaptive_entropy_chunker(
                 doc, f"{doc['doc_id']}_{chunk_idx}",
                 buf_text, start, end,
             ))
-            cursor    = end
-            chunk_idx += 1
+            cursor      = end
+            chunk_idx  += 1
             buf_sents   = []
             buf_entropy = []
 
-    # Flush remaining
     if buf_sents:
         buf_text = " ".join(buf_sents)
         start    = _find_offset(text, buf_sents[0], cursor)
@@ -182,9 +187,9 @@ def adaptive_sentence_len_chunker(
     Algorithm:
       1. Compute mean character length of sentences in a rolling window.
       2. Short-sentence passages (< short_threshold chars/sent):
-           use fewer sentences per chunk (min_sentences) — finer granularity.
+           use fewer sentences per chunk (min_sentences).
       3. Long-sentence passages (> long_threshold chars/sent):
-           use more sentences per chunk (max_sentences) — coarser granularity.
+           use more sentences per chunk (max_sentences).
       4. Medium passages: target_sentences per chunk.
     """
     text      = doc["text"]
@@ -192,22 +197,20 @@ def adaptive_sentence_len_chunker(
     if not sentences:
         return []
 
-    chunks:    list[dict] = []
-    cursor     = 0
-    chunk_idx  = 0
-    i          = 0
+    chunks:   list[dict] = []
+    cursor    = 0
+    chunk_idx = 0
+    i         = 0
 
     while i < len(sentences):
-        # Look-ahead window to estimate local sentence length
-        window     = sentences[i : i + target_sentences]
-        mean_len   = sum(len(s) for s in window) / max(len(window), 1)
+        window   = sentences[i : i + target_sentences]
+        mean_len = sum(len(s) for s in window) / max(len(window), 1)
 
         if mean_len < short_threshold:
             n = min_sentences
         elif mean_len > long_threshold:
             n = max_sentences
         else:
-            # Linear interpolation in the medium range
             ratio = (mean_len - short_threshold) / (long_threshold - short_threshold)
             n     = int(min_sentences + ratio * (max_sentences - min_sentences))
 
@@ -262,27 +265,25 @@ def hierarchical_parent_child_chunker(
     )
 
     parent_texts = parent_splitter.split_text(text)
-    all_chunks: list[dict] = []
+    all_chunks:  list[dict] = []
     p_cursor   = 0
     p_idx      = 0
 
     for p_text in parent_texts:
-        p_start    = _find_offset(text, p_text, p_cursor)
-        p_end      = p_start + len(p_text)
-        parent_id  = f"{doc['doc_id']}_p{p_idx}"
+        p_start   = _find_offset(text, p_text, p_cursor)
+        p_end     = p_start + len(p_text)
+        parent_id = f"{doc['doc_id']}_p{p_idx}"
 
-        # Parent chunk
         all_chunks.append(_make_chunk(
             doc, parent_id, p_text, p_start, p_end,
             parent_id=None, level="parent",
         ))
 
-        # Child chunks
         child_texts = child_splitter.split_text(p_text)
         c_cursor    = p_start
         c_idx       = 0
         for c_text in child_texts:
-            c_start = _find_offset(p_text, c_text, c_cursor - p_start)
+            c_start  = _find_offset(p_text, c_text, c_cursor - p_start)
             c_start += p_start
             c_end    = c_start + len(c_text)
             all_chunks.append(_make_chunk(
@@ -333,16 +334,13 @@ def contextual_chunker(
     raw_chunks = splitter.split_text(text)
     n_chunks   = len(raw_chunks)
 
-    chunks:  list[dict] = []
-    cursor   = 0
+    chunks: list[dict] = []
+    cursor  = 0
     for i, raw in enumerate(raw_chunks):
-        start   = _find_offset(text, raw, cursor)
-        end     = start + len(raw)
-
-        # Prepend context header
-        header     = f"[Context: {doc['title']} | Part {i+1}/{n_chunks}] "
-        enriched   = header + raw
-
+        start    = _find_offset(text, raw, cursor)
+        end      = start + len(raw)
+        header   = f"[Context: {doc['title']} | Part {i+1}/{n_chunks}] "
+        enriched = header + raw
         chunks.append(_make_chunk(
             doc, f"{doc['doc_id']}_{i}",
             enriched, start, end,
@@ -395,14 +393,10 @@ def topic_based_chunker(
 
     k = min(n_topics, len(sentences))
 
-    # Embed sentences
-    vecs = np.array(embed_fn(sentences), dtype=np.float32)
-
-    # K-means topic clustering
+    vecs   = np.array(embed_fn(sentences), dtype=np.float32)
     km     = KMeans(n_clusters=k, random_state=42, n_init="auto")
     labels = km.fit_predict(vecs)   # (N,) integer topic label per sentence
 
-    # Group consecutive sentences with the same label
     chunks:    list[dict] = []
     chunk_idx  = 0
     cursor     = 0
@@ -410,10 +404,9 @@ def topic_based_chunker(
     buf_label  = int(labels[0])
 
     for sent, label in zip(sentences[1:], labels[1:]):
-        label = int(label)
+        label    = int(label)
         buf_text = " ".join(buf_sents)
 
-        # New chunk when topic changes AND buffer is big enough
         if label != buf_label and len(buf_text) >= min_chunk_size:
             start = _find_offset(text, buf_sents[0], cursor)
             end   = start + len(buf_text)
@@ -428,7 +421,6 @@ def topic_based_chunker(
         else:
             buf_sents.append(sent)
 
-    # Flush
     if buf_sents:
         buf_text = " ".join(buf_sents)
         start    = _find_offset(text, buf_sents[0], cursor)
@@ -449,11 +441,15 @@ def fixed_size_chunker(
     overlap: int = 0,
 ) -> list[dict]:
     """
-    FixedSize — cắt text theo số ký tự cố định, không quan tâm ranh giới
-    câu hay từ. Đây là phương pháp đơn giản nhất, dùng làm baseline.
+    FixedSize — split text into fixed-length character windows with no
+    sentence-boundary awareness. Simplest possible baseline.
 
-    overlap > 0 → tạo sliding window (mỗi chunk kế tiếp bắt đầu lùi lại
-    `overlap` ký tự so với điểm kết thúc của chunk trước).
+    Args:
+        doc        : document dict with "text" field.
+        chunk_size : window length in characters.
+        overlap    : overlap between consecutive windows in characters.
+                     overlap > 0 creates a sliding window where each chunk
+                     starts `overlap` characters before the previous chunk ended.
     """
     text   = doc["text"]
     chunks = []
@@ -480,21 +476,21 @@ def recursive_chunker(
     overlap: int = 0,
 ) -> list[dict]:
     """
-    Recursive / RecursiveCharacterTextSplitter — cắt theo ưu tiên phân
-    cấp: paragraph (\\n\\n) → sentence (. ! ?) → space → ký tự.
+    Recursive / RecursiveCharacterTextSplitter — hierarchical split
+    preferring paragraph (\\n\\n) => sentence (.!?) => space => character.
 
-    Đây là chiến lược mặc định của LangChain và được dùng làm baseline
-    chính trong paper Berdyugina et al. (2026, arXiv:2604.24334).
+    Default strategy in LangChain and the primary baseline in
+    Berdyugina et al. (2026, arXiv:2604.24334).
     """
     separators = ["\n\n", "\n", ". ", "! ", "? ", " ", ""]
 
     def _split(text: str, seps: list[str]) -> list[str]:
         if not seps:
             return [text[i:i + chunk_size] for i in range(0, len(text), max(1, chunk_size - overlap))]
-        sep = seps[0]
-        parts = text.split(sep) if sep else list(text)
+        sep    = seps[0]
+        parts  = text.split(sep) if sep else list(text)
         result: list[str] = []
-        buf = ""
+        buf    = ""
         for part in parts:
             candidate = (buf + sep + part).strip() if buf else part.strip()
             if len(candidate) <= chunk_size:
@@ -514,7 +510,7 @@ def recursive_chunker(
     text   = doc["text"]
     pieces = _split(text, separators)
 
-    # Merge tiny pieces into neighbours and apply overlap
+    # Merge small pieces and apply overlap
     merged: list[str] = []
     buf = ""
     for p in pieces:
@@ -530,22 +526,17 @@ def recursive_chunker(
     if buf:
         merged.append(buf)
 
-    # Apply overlap: each chunk starts `overlap` chars before the end of prev
     chunks  = []
     carried = ""
     for i, piece in enumerate(merged):
         text_with_carry = (carried + " " + piece).strip() if carried else piece
-        chunk_text = text_with_carry[:chunk_size].strip()
+        chunk_text      = text_with_carry[:chunk_size].strip()
         if chunk_text:
             start = text.find(chunk_text[:30]) if chunk_text[:30] in text else 0
             chunks.append(_make_chunk(
                 doc, f"{doc['doc_id']}_{i}", chunk_text, start, start + len(chunk_text),
             ))
-        # Carry-over for overlap
-        if overlap > 0 and chunk_text:
-            carried = chunk_text[-overlap:].strip()
-        else:
-            carried = ""
+        carried = chunk_text[-overlap:].strip() if overlap > 0 and chunk_text else ""
 
     return chunks
 
@@ -556,14 +547,21 @@ def semantic_chunker(
     embed_fn: Callable | None = None,
 ) -> list[dict]:
     """
-    SemanticChunker / ClusterSemantic (v3) — cắt tại điểm có cosine
-    distance giữa 2 câu liên tiếp vượt ngưỡng percentile.
+    SemanticChunker / ClusterSemantic (v3) — sequential breakpoint detection.
 
-    Đây là chiến lược "sequential breakpoint detection" — chỉ nhìn vào
-    khoảng cách ngữ nghĩa CỤC BỘ (local) giữa 2 câu kề nhau, khác với
-    TopicBased dùng global clustering.
+    A new chunk boundary is placed wherever the cosine distance between two
+    consecutive sentences exceeds the given percentile of all pairwise distances.
+    This is a local (sequential) approach, unlike TopicBased which uses global
+    k-means clustering.
 
-    Fallback: nếu không có embed_fn, dùng RecursiveChunker.
+    Fallback to RecursiveChunker if embed_fn is None.
+
+    Args:
+        doc                  : document dict.
+        threshold_percentile : percentile of cosine distances used as the
+                               breakpoint threshold (e.g. 95.0 => top 5% of
+                               distances become boundaries).
+        embed_fn             : callable(list[str]) => list[list[float]].
     """
     if embed_fn is None:
         logger.debug("SemanticChunker: no embed_fn, falling back to RecursiveChunker")
@@ -573,15 +571,12 @@ def semantic_chunker(
     if len(sentences) < 3:
         return recursive_chunker(doc, chunk_size=500, overlap=0)
 
-    # Embed từng câu
-    vecs = np.array(embed_fn(sentences), dtype=np.float32)
-
-    # Chuẩn hóa L2
+    vecs  = np.array(embed_fn(sentences), dtype=np.float32)
     norms = np.linalg.norm(vecs, axis=1, keepdims=True)
     norms = np.where(norms < 1e-9, 1.0, norms)
     vecs  = vecs / norms
 
-    # Cosine distance giữa câu liên tiếp
+    # Cosine distance between consecutive sentences
     distances = [
         float(1.0 - np.dot(vecs[i], vecs[i + 1]))
         for i in range(len(vecs) - 1)
@@ -589,11 +584,10 @@ def semantic_chunker(
 
     threshold = float(np.percentile(distances, threshold_percentile))
 
-    # Cắt tại điểm distance > threshold
+    text    = doc["text"]
     chunks  = []
     buf     = [sentences[0]]
     chunk_i = 0
-    text    = doc["text"]
     cursor  = 0
 
     for i, dist in enumerate(distances):
@@ -611,7 +605,6 @@ def semantic_chunker(
         else:
             buf.append(sentences[i + 1])
 
-    # Flush
     if buf:
         chunk_text = " ".join(buf).strip()
         if chunk_text:
@@ -630,31 +623,36 @@ def overlapping_chunker(
     overlap: int = 100,
 ) -> list[dict]:
     """
-    Overlapping / SlidingWindow — giống FixedSize nhưng luôn có overlap
-    giữa các chunk liên tiếp, đảm bảo không bị mất thông tin tại ranh
-    giới chunk. Đây là một trong các baseline phổ biến nhất trong RAG.
+    Overlapping / SlidingWindow — like FixedSize but always with overlap
+    between consecutive chunks, split at word boundaries to preserve coherence.
 
-    Khác với FixedSize(overlap>0): Overlapping cắt tại ranh giới từ
-    (không cắt giữa từ) để chunk text vẫn có nghĩa.
+    Difference from FixedSize(overlap>0): this chunker never cuts in the
+    middle of a word, ensuring each chunk is human-readable.
 
-    overlap phải < chunk_size. Mặc định overlap = chunk_size // 5.
+    Args:
+        doc        : document dict.
+        chunk_size : target chunk length in characters.
+        overlap    : overlap in characters (must be < chunk_size).
+                     Clamped to chunk_size // 5 if violated.
     """
     if overlap >= chunk_size:
         overlap = chunk_size // 5
         logger.warning("overlap >= chunk_size, clamped to %d", overlap)
 
-    text   = doc["text"]
-    words  = text.split()
-    chunks = []
-    idx    = 0
+    text  = doc["text"]
+    words = text.split()
+    if not words:
+        return []
 
-    # Ước lượng số từ mỗi chunk theo tỷ lệ chars/words trung bình
-    avg_word_len = len(text) / max(len(words), 1)
+    # Estimate word count per chunk from the average chars-per-word ratio
+    avg_word_len    = len(text) / len(words)
     words_per_chunk = max(1, int(chunk_size / avg_word_len))
     words_overlap   = max(0, int(overlap   / avg_word_len))
-    step = max(1, words_per_chunk - words_overlap)
+    step            = max(1, words_per_chunk - words_overlap)
 
-    i = 0
+    chunks = []
+    idx    = 0
+    i      = 0
     while i < len(words):
         chunk_words = words[i:i + words_per_chunk]
         chunk_text  = " ".join(chunk_words).strip()
@@ -679,7 +677,7 @@ def get_chunker(
     embed_fn:   Callable | None = None,
     extra:      dict | None = None,
 ):
-    """Return a callable(doc) → list[chunk] for the given strategy."""
+    """Return a callable(doc) => list[chunk] for the given strategy."""
     extra = extra or {}
 
     if strategy == "FixedSize":
@@ -725,7 +723,6 @@ def get_chunker(
             doc, chunk_size=chunk_size, overlap=overlap,
         )
     elif strategy == "TopicBased":
-        # Explicitly capture embed_fn in default argument to avoid closure bug
         return lambda doc, _fn=embed_fn: topic_based_chunker(
             doc,
             n_topics=extra.get("n_topics", 5),
@@ -746,10 +743,11 @@ def chunk_documents(
 ) -> tuple[list[dict], float]:
     """
     Chunk all documents with the given strategy.
+
     Returns (chunks, elapsed_seconds).
     """
-    chunker = get_chunker(strategy, chunk_size, overlap,
-                          embed_fn=embed_fn, extra=extra)
+    chunker    = get_chunker(strategy, chunk_size, overlap,
+                             embed_fn=embed_fn, extra=extra)
     t0         = time.perf_counter()
     all_chunks = []
     for doc in documents:
@@ -757,7 +755,7 @@ def chunk_documents(
     elapsed = time.perf_counter() - t0
 
     logger.info(
-        "Chunked %d docs → %d chunks [%s size=%d overlap=%d] in %.2fs",
+        "Chunked %d docs => %d chunks [%s size=%d overlap=%d] in %.2fs",
         len(documents), len(all_chunks),
         strategy, chunk_size, overlap, elapsed,
     )

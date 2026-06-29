@@ -1,27 +1,26 @@
 """
 CACD Benchmark — main entry point.
 
-Chunk strategies : AdaptiveEntropy, AdaptiveSentenceLen,
+Chunk strategies : FixedSize, Recursive, Semantic, Overlapping,
+                   AdaptiveEntropy, AdaptiveSentenceLen,
                    HierarchicalParentChild, Contextual, TopicBased
-                   (giữ nguyên từ rag-bench-v4)
 Dedup pipeline   : CACD (Cross-Attention Calibrated Deduplication)
-                   Stage 0 Embedding → Stage 1 Coarse retrieval (HNSW) →
-                   Stage 2 Cross-attention scoring → Stage 3 Decision
-                   (chỉ nhánh DROP, không Merge)
+                   Stage 0 Embedding => Stage 1 Coarse retrieval (HNSW) =>
+                   Stage 2 Cross-attention scoring => Stage 3 Decision
+                   (DROP branch only, Merge reserved for future work)
 Eval metrics     : Precision, Recall, IoU, Index Size (chunk count + storage MB)
 
 Usage:
     # Debug (small)
     python scripts/benchmark.py --max-docs 20 --max-questions 30
 
-    # Single strategy (đề xuất bắt đầu với Contextual — case "khó nhất"
-    # cho NERExact trong baseline cũ, nơi CACD cần chứng minh giá trị)
+    # Single strategy
     python scripts/benchmark.py --strategy Contextual --max-docs 50 --max-questions 50
 
     # Single config
     python scripts/benchmark.py --config "Contextual_300_0"
 
-    # Full benchmark (toàn bộ 10 configs)
+    # Full benchmark (all 18 configs)
     python scripts/benchmark.py
 
     # Background
@@ -61,7 +60,7 @@ logger = logging.getLogger(__name__)
 # ── Config name ───────────────────────────────────────────────────────────────
 
 def make_config_name(strategy: str, chunk_size: int, overlap: int) -> str:
-    """Format: "{strategy}_{size}_{overlap}" — mỗi config chỉ chạy 1 pipeline CACD."""
+    """Format: "{strategy}_{size}_{overlap}" — one CACD pipeline per config."""
     return f"{strategy}_{chunk_size}_{overlap}"
 
 
@@ -99,7 +98,7 @@ AUDIT_FIELDS = [
 ]
 
 
-# ── Ingest (CACD) ────────────────────────────────────────────────────────────
+# ── Ingest (CACD) ─────────────────────────────────────────────────────────────
 
 def run_ingest_cacd(
     documents:   list[dict],
@@ -111,8 +110,8 @@ def run_ingest_cacd(
     extra:       dict | None = None,
 ) -> tuple[list[dict], list[dict], float, str, dict, list[dict]]:
     """
-    Chunk → CACD dedup (Stage 1-3, drop only, insert trực tiếp vào Qdrant
-    bên trong run_cacd_dedup) cho một chunking config.
+    Chunk => CACD dedup (Stage 1-3, drop only; chunks are inserted into
+    Qdrant incrementally inside run_cacd_dedup) for one chunking config.
 
     Returns (chunks_before, chunks_after, ingest_time_s, cname, stats, audit_log).
     """
@@ -123,21 +122,21 @@ def run_ingest_cacd(
         documents, strategy, chunk_size, overlap,
         embed_fn=embed_fn, extra=extra,
     )
-    logger.info("  %d chunks trước CACD dedup", len(chunks_raw))
+    logger.info("  %d chunks before CACD dedup", len(chunks_raw))
 
-    # Step 2: Embed toàn bộ chunk (Stage 0)
+    # Step 2: Embed all chunks (Stage 0)
     dense_vecs: list[list[float]] = []
     embedded_chunks: list[dict] = []
     for chunk, dv in embed_chunks_batched(chunks_raw, batch_size=EMBED_BATCH_SIZE):
         embedded_chunks.append(chunk)
         dense_vecs.append(dv)
 
-    # Step 3: Tạo collection rỗng, rồi để run_cacd_dedup tự insert dần
-    # (mỗi chunk được kiểm tra với index ĐÃ CÓ trước khi quyết định insert).
+    # Step 3: Create an empty collection; run_cacd_dedup inserts chunks
+    # incrementally so each new chunk is checked against the already-indexed ones.
     cname = collection_name(strategy, chunk_size, overlap, "cacd")
     ensure_collection(cname, recreate=True)
 
-    # Step 4: Chạy CACD (Stage 1 → 2 → 3, chỉ nhánh Drop)
+    # Step 4: Run CACD (Stage 1 => 2 => 3, DROP branch only)
     kept_chunks, audit_log = run_cacd_dedup(
         embedded_chunks, dense_vecs, cname, config_name,
         save_heatmaps=True,
@@ -153,7 +152,7 @@ def run_ingest_cacd(
     return chunks_raw, kept_chunks, ingest_time, cname, stats, audit_log
 
 
-# ── Evaluate (giữ nguyên từ v4) ──────────────────────────────────────────────
+# ── Evaluate ──────────────────────────────────────────────────────────────────
 
 def run_eval(
     qa_pairs:   list[dict],
@@ -161,7 +160,11 @@ def run_eval(
     cname:      str,
     config_name: str,
 ) -> tuple[dict, list[dict]]:
-    """Evaluate retrieval bằng Precision, Recall, IoU. Returns (summary, per_q_rows)."""
+    """
+    Evaluate retrieval using Precision, Recall, IoU.
+
+    Returns (summary, per_q_rows).
+    """
     doc_lookup: dict[str, dict] = {d["doc_id"]: d for d in documents}
 
     acc: dict[str, list[float]] = {k: [] for k in [
@@ -263,7 +266,6 @@ def main() -> None:
 
     embed_fn = lambda texts: embed_texts(texts)
 
-    # ── Filter configs from CLI ───────────────────────────────────────────
     configs = list(CHUNKING_CONFIGS)
 
     if args.strategy:
@@ -279,7 +281,6 @@ def main() -> None:
 
     logger.info("Running %d configs.", len(configs))
 
-    # ── Summary CSV ───────────────────────────────────────────────────────
     summary_path = RESULTS_DIR / "benchmark_results.csv"
     is_new       = not summary_path.exists()
     summary_f    = open(summary_path, "a", newline="", encoding="utf-8")
@@ -287,7 +288,6 @@ def main() -> None:
     if is_new:
         writer.writeheader()
 
-    # ── Run ───────────────────────────────────────────────────────────────
     for cfg in configs:
         strategy   = cfg["strategy"]
         chunk_size = cfg["chunk_size"]
@@ -317,7 +317,7 @@ def main() -> None:
             pq_writer.writeheader()
             pq_writer.writerows(per_q)
 
-        # Audit log CSV (quyết định drop/keep cho từng chunk, kèm điểm CACD)
+        # Audit log CSV — drop/keep decision for each chunk with CACD scores
         audit_path = RESULTS_DIR / f"audit_{cname_str}.csv"
         with open(audit_path, "w", newline="", encoding="utf-8") as f:
             a_writer = csv.DictWriter(f, fieldnames=AUDIT_FIELDS)
@@ -325,7 +325,6 @@ def main() -> None:
             for row in audit_log:
                 a_writer.writerow({k: row.get(k, "") for k in AUDIT_FIELDS})
 
-        # Summary row
         row = {
             "config_name":               cname_str,
             "strategy":                  strategy,
@@ -346,7 +345,7 @@ def main() -> None:
         summary_f.flush()
 
         logger.info(
-            "  DONE | chunks=%d→%d (-%.1f%%) | %.1fs | %.2f MB (%s) | "
+            "  DONE | chunks=%d=>%d (-%.1f%%) | %.1fs | %.2f MB (%s) | "
             "P=%.3f R=%.3f IoU=%.3f",
             n_before, n_after, reduction_pct,
             ingest_time, stats["disk_mb"], stats["disk_size_du"],

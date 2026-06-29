@@ -5,13 +5,17 @@ Uses QdrantClient(path=...) — no Docker, no port, no root.
 
 API compatibility note:
   Older Qdrant used named vectors via VectorsConfig(dense=VectorParams(...)).
-  Newer Qdrant (≥1.9) deprecated that Union syntax. We now use the simpler
+  Newer Qdrant (>=1.9) deprecated that Union syntax. We now use the simpler
   unnamed vector API: vectors_config=VectorParams(...) directly, and pass
   plain list[float] as the vector in PointStruct and query_points.
 
 Collection name format:
   "{COLLECTION_PREFIX}_{strategy}_{size}_{overlap}__cacd"
   e.g. "cacd_dedup_Contextual_300_0__cacd"
+
+Payload fields stored per chunk:
+  chunk_id, doc_id, title, text, char_start, char_end,
+  parent_id, level  (used by Stage 2 to skip parent-child pairs)
 """
 
 from __future__ import annotations
@@ -47,7 +51,7 @@ def get_client() -> QdrantClient:
 
 
 def collection_name(strategy: str, chunk_size: int, overlap: int, filter_tag: str) -> str:
-    """Stable collection name for one (chunker × filter) config."""
+    """Stable collection name for one (chunker x filter) config."""
     base = f"{COLLECTION_PREFIX}_{strategy}_{chunk_size}_{overlap}"
     if filter_tag:
         return f"{base}__{filter_tag}"
@@ -56,7 +60,7 @@ def collection_name(strategy: str, chunk_size: int, overlap: int, filter_tag: st
 
 def ensure_collection(cname: str, recreate: bool = True) -> str:
     """Create (or recreate) a Qdrant collection."""
-    client = get_client()
+    client   = get_client()
     existing = [c.name for c in client.get_collections().collections]
 
     if cname in existing:
@@ -67,7 +71,6 @@ def ensure_collection(cname: str, recreate: bool = True) -> str:
             logger.info("Collection '%s' already exists — skipping.", cname)
             return cname
 
-    # Use unnamed vector API (compatible with all Qdrant ≥1.7)
     client.create_collection(
         collection_name=cname,
         vectors_config=VectorParams(
@@ -105,7 +108,7 @@ def upsert_chunks(
                     "text":       chunk["text"],
                     "char_start": chunk["char_start"],
                     "char_end":   chunk["char_end"],
-                    # HierarchicalParentChild — dùng để skip parent-child pairs
+                    # Stored for HierarchicalParentChild parent-child skip guard
                     "parent_id":  chunk.get("parent_id"),
                     "level":      chunk.get("level"),
                 },
@@ -120,12 +123,11 @@ def upsert_chunks(
 def collection_stats(cname: str) -> dict:
     """Return point count and disk size for a collection."""
     client = get_client()
-    info = client.get_collection(cname)
+    info   = client.get_collection(cname)
 
-    # Use 'du -sh' as required by the benchmark spec
-    col_path = QDRANT_PATH / "collection" / cname
+    col_path      = QDRANT_PATH / "collection" / cname
     disk_size_str = "0"
-    disk_mb = 0.0
+    disk_mb       = 0.0
     if col_path.exists():
         try:
             result = subprocess.run(
@@ -136,7 +138,6 @@ def collection_stats(cname: str) -> dict:
                 disk_size_str = result.stdout.split("\t")[0].strip()
         except Exception:
             pass
-        # Also compute MB numerically for CSV
         disk_bytes = sum(
             f.stat().st_size
             for f in col_path.rglob("*")
@@ -154,7 +155,7 @@ def collection_stats(cname: str) -> dict:
 
 def delete_collection(cname: str) -> None:
     """Delete a collection to free disk space after benchmarking."""
-    client = get_client()
+    client   = get_client()
     existing = [c.name for c in client.get_collections().collections]
     if cname in existing:
         client.delete_collection(cname)

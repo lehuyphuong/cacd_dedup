@@ -1,25 +1,23 @@
 """
 CACD Stage 2 — Cross-Attention Redundancy Scorer (CARS).
 
-Pipeline doc Section 4.1, "Đóng góp 2":
-  Với mỗi cặp (chunk_mới, candidate_i):
-    2a. Joint encoding: [CLS] chunk_mới [SEP] candidate_i [SEP]
-    2b. Trích xuất attention matrix (mọi layer, mọi head, không pooling sớm)
-    2c. Tổng hợp redundancy signal (max-alignment kiểu BERTScore)
-    2d. Output calibrated probability P(duplicate | attention_pattern)
+Role: for each pair (new_chunk, candidate_i), produce a redundancy signal
+by jointly encoding both texts through a cross-encoder and extracting
+information from the resulting attention matrix.
 
-Model: cross-encoder/ms-marco-MiniLM-L-6-v2 (pretrained, KHÔNG fine-tune
-— theo quyết định của user). Model này vốn được train cho passage
-relevance scoring (MS MARCO), nên raw logit của nó không trực tiếp
-là "xác suất duplicate" — cần một bước calibration nhẹ (temperature
-scaling không-tham-số, dựa trên thống kê batch) để biến raw score
-thành P(duplicate) có thể diễn giải được, đúng tinh thần
-"calibrated probability" trong thiết kế (không phải threshold đoán mò
-trên cosine similarity).
+Pipeline:
+  2a. Joint encoding : [CLS] new_chunk [SEP] candidate_i [SEP]
+  2b. Attention extraction : last layer, averaged across all heads
+  2c. Coverage signals : max-alignment coverage (BERTScore-style)
+  2d. Novel Information Score (NIS) : entropy of attention B => A
 
-Độ phức tạp: O(K) forward pass đầy đủ cho mỗi chunk mới — K là hằng
-số nhỏ (CACD_TOP_K_CANDIDATES), không phụ thuộc n vì Stage 1 đã thu
-hẹp candidate set.
+Model: cross-encoder/msmarco-MiniLM-L6-en-de-v1 (pretrained, no fine-tuning).
+Complexity: O(K) forward passes per new chunk; K is a small constant
+            (CACD_TOP_K_CANDIDATES) because Stage 1 already narrowed candidates.
+
+Public API:
+  score_pair(text_a, text_b)          => dict of scores for one pair
+  score_candidates(chunk_text, cands) => list of scored candidate dicts
 """
 
 from __future__ import annotations
@@ -35,18 +33,18 @@ from configs.settings import CACD_CROSS_ENCODER_MODEL, DEVICE
 logger = logging.getLogger(__name__)
 
 _tokenizer = None
-_model = None
+_model     = None
 
 
 def get_cross_encoder():
-    """Lazy-load cross-encoder model + tokenizer (pretrained, no fine-tune)."""
+    """Lazy-load cross-encoder model and tokenizer (pretrained, no fine-tuning)."""
     global _tokenizer, _model
     if _model is None:
         logger.info("Loading cross-encoder: %s", CACD_CROSS_ENCODER_MODEL)
         _tokenizer = AutoTokenizer.from_pretrained(CACD_CROSS_ENCODER_MODEL)
-        _model = AutoModelForSequenceClassification.from_pretrained(
+        _model     = AutoModelForSequenceClassification.from_pretrained(
             CACD_CROSS_ENCODER_MODEL,
-            output_attentions=True,   # cần attention matrix, không chỉ logit
+            output_attentions=True,   # attention matrix required, not just logits
         )
         _model.to(DEVICE)
         _model.eval()
@@ -60,24 +58,23 @@ def _max_alignment_coverage(
     n_tokens: int,
 ) -> tuple[float, float]:
     """
-    Tổng hợp redundancy signal từ attention matrix — max-alignment
-    kiểu BERTScore (Stage 2c trong pipeline).
+    Compute max-alignment coverage from the attention matrix (BERTScore-style).
 
-    Với attention layer cuối, đã average qua các head:
-      coverage(A→B) = trung bình, với mỗi token A, giá trị attention
-                      LỚN NHẤT mà nó dành cho bất kỳ token nào bên B
-      coverage(B→A) = tương tự, theo chiều ngược lại
+    For the last attention layer averaged across heads:
+      coverage(A => B) = mean over tokens in A of the maximum attention weight
+                         that token assigns to any token in B.
+      coverage(B => A) = same, in the opposite direction.
 
     Args:
-        attn    : ma trận attention (n_tokens, n_tokens), đã average head.
-        sep_idx : vị trí token [SEP] đầu tiên (ranh giới A/B).
-        n_tokens: tổng số token thật (bỏ padding).
+        attn    : attention matrix (n_tokens, n_tokens), heads already averaged.
+        sep_idx : position of the first [SEP] token (A/B boundary).
+        n_tokens: total number of real tokens (excluding padding).
 
     Returns:
         (coverage_a_to_b, coverage_b_to_a)
     """
-    # Vùng A: token 1..sep_idx-1 (bỏ [CLS] ở vị trí 0)
-    # Vùng B: token sep_idx+1..n_tokens-2 (bỏ [SEP] cuối)
+    # Region A: tokens 1..sep_idx-1 (excluding [CLS] at position 0)
+    # Region B: tokens sep_idx+1..n_tokens-2 (excluding final [SEP])
     a_range = slice(1, sep_idx)
     b_range = slice(sep_idx + 1, n_tokens - 1)
 
@@ -87,7 +84,7 @@ def _max_alignment_coverage(
     if sub_a_to_b.numel() == 0 or sub_b_to_a.numel() == 0:
         return 0.0, 0.0
 
-    # Mỗi token A tìm token khớp nhất bên B (max theo chiều B), rồi trung bình
+    # Each token in A finds its best-matching token in B (max over B dimension), then average
     coverage_a_to_b = sub_a_to_b.max(dim=1).values.mean().item()
     coverage_b_to_a = sub_b_to_a.max(dim=1).values.mean().item()
 
@@ -100,34 +97,41 @@ def _novel_information_score(
     n_tokens: int,
 ) -> float:
     """
-    Novel Information Score (NIS) — đo mức độ thông tin MỚI mà B mang
-    lại so với A, dựa trên entropy của attention distribution B→A.
+    Novel Information Score (NIS) — measures how much new information B
+    carries relative to A, based on the entropy of the attention B => A.
 
-    Nền tảng lý thuyết (Information Theory):
-      - Attention B→A[j, :] = phân phối xác suất token j của B
-        "dựa vào" các token nào trong A để hiểu nghĩa của mình
-      - Entropy(attention B→A[j]) thấp → token j tập trung attention
-        vào 1-2 token cụ thể trong A → A "giải thích" được token j
-        → token j KHÔNG mang thông tin mới
-      - Entropy(attention B→A[j]) cao → token j phân tán attention
-        đều khắp A → A không có token nào "giải thích" được token j
-        → token j CÓ THỂ mang thông tin mới
+    Theoretical basis (Information Theory):
+      attention B=>A[j, :] is a probability distribution over tokens in A,
+      representing how much token j in B relies on tokens in A for context.
 
-    NIS(B|A) = mean entropy của attention B→A, chuẩn hóa về [0, 1]:
-      NIS → 0: B hoàn toàn được "giải thích" bởi A → DROP candidate
-      NIS → 1: B hoàn toàn khác A về thông tin       → KEEP
+      Low entropy of attention B=>A[j]:
+        token j focuses on 1-2 specific tokens in A
+        => A can "explain" token j
+        => token j carries little new information.
 
-    Quan trọng: chuẩn hóa dùng log(|A|) — maximum entropy lý thuyết
-    khi token B phân tán đều hoàn toàn sang tất cả token A.
-    Đây là ngưỡng tự nhiên từ Information Theory, không phải số đặt tay.
+      High entropy of attention B=>A[j]:
+        token j spreads attention uniformly across A
+        => no token in A can explain token j
+        => token j likely carries new information.
+
+    Formula:
+      1. Re-normalise sub_B=>A row-wise (removes softmax dilution from full sequence).
+      2. H(j) = -sum_i p(i|j) * log(p(i|j))   per token j in B.
+      3. NIS = mean(H(j)) / log(|A|)            normalised to [0, 1].
+
+    Normalisation uses log(|A|) — the theoretical maximum entropy when token B
+    spreads uniformly across all tokens in A. This is a natural scale from
+    Information Theory, not a hand-picked constant.
 
     Args:
-        attn    : ma trận attention (n_tokens, n_tokens), đã average head.
-        sep_idx : vị trí [SEP] đầu tiên (ranh giới A/B).
-        n_tokens: tổng số token thật.
+        attn    : attention matrix (n_tokens, n_tokens), heads already averaged.
+        sep_idx : position of the first [SEP] token (A/B boundary).
+        n_tokens: total number of real tokens.
 
     Returns:
-        nis: float trong [0, 1], càng thấp → B càng ít thông tin mới.
+        nis: float in [0, 1].
+             NIS => 0: B is fully explained by A => DROP candidate.
+             NIS => 1: B is entirely novel relative to A => KEEP.
     """
     a_range = slice(1, sep_idx)
     b_range = slice(sep_idx + 1, n_tokens - 1)
@@ -135,29 +139,27 @@ def _novel_information_score(
     sub_b_to_a = attn[b_range, a_range]   # (len_B, len_A)
 
     if sub_b_to_a.numel() == 0:
-        return 1.0   # Không có gì để so sánh → coi như B hoàn toàn mới
+        return 1.0   # nothing to compare => treat B as entirely novel
 
     len_a = sub_b_to_a.shape[1]
     if len_a < 2:
         return 1.0
 
-    # Chuẩn hóa lại attention B→A CHỈ TRÊN PHẦN A
-    # (loại bỏ ảnh hưởng pha loãng của softmax toàn chuỗi)
-    row_sums = sub_b_to_a.sum(dim=1, keepdim=True).clamp(min=1e-9)
-    prob_b_to_a = sub_b_to_a / row_sums   # (len_B, len_A), mỗi hàng sum=1
+    # Re-normalise attention B=>A over the A region only
+    # (removes softmax dilution caused by attending to the full sequence)
+    row_sums    = sub_b_to_a.sum(dim=1, keepdim=True).clamp(min=1e-9)
+    prob_b_to_a = sub_b_to_a / row_sums   # (len_B, len_A), each row sums to 1
 
-    # Entropy của từng token B
-    # H(j) = -sum_i p(i|j) * log(p(i|j))
+    # Entropy per token in B:  H(j) = -sum_i p(i|j) * log(p(i|j))
     ent_per_token = -(prob_b_to_a * torch.log(prob_b_to_a + 1e-9)).sum(dim=1)  # (len_B,)
 
-    # Maximum entropy lý thuyết = log(len_A)
-    # Đây là ngưỡng tự nhiên: token B phân tán đều hoàn toàn sang mọi A
+    # Theoretical maximum entropy = log(len_A)
+    # (achieved when token B spreads uniformly across all tokens in A)
     max_ent = float(np.log(len_a))
 
     if max_ent < 1e-9:
         return 1.0
 
-    # NIS = mean normalized entropy
     nis = float((ent_per_token / max_ent).mean().clamp(0.0, 1.0).item())
     return round(nis, 4)
 
@@ -165,19 +167,19 @@ def _novel_information_score(
 @torch.no_grad()
 def score_pair(text_a: str, text_b: str) -> dict:
     """
-    Chấm điểm redundancy cho 1 cặp (text_a, text_b) qua cross-encoder.
+    Score the redundancy of one pair (text_a, text_b) via the cross-encoder.
 
-    Returns:
-        {
-          "raw_logit": float,           # output thô của cross-encoder
-          "coverage_a_to_b": float,      # % nội dung A được B bao phủ
-          "coverage_b_to_a": float,      # % nội dung B được A bao phủ
-          "attn_entropy": float,         # độ tản mát attention (0-1)
-          "attention_matrix": np.ndarray,# ma trận attention đầy đủ (để vẽ heatmap)
-          "tokens_a": list[str],
-          "tokens_b": list[str],
-          "sep_idx": int,
-        }
+    Input:
+        text_a : new chunk (A).
+        text_b : candidate chunk already in the index (B).
+
+    Returns dict:
+        raw_logit       : float  -- raw cross-encoder output
+        prob_duplicate  : float  -- sigmoid(logit) for binary models;
+                                    softmax[-1] for multi-class models
+        coverage_a_to_b : float  -- fraction of A's content covered by B
+        coverage_b_to_a : float  -- fraction of B's content covered by A
+        nis_b_given_a   : float  -- Novel Information Score of B given A
     """
     tokenizer, model = get_cross_encoder()
 
@@ -191,31 +193,29 @@ def score_pair(text_a: str, text_b: str) -> dict:
 
     outputs = model(**inputs)
 
-    # Xử lý cả model binary (1 logit) và multi-class (vd. NLI 3 class)
+    # Handle both binary models (scalar logit) and multi-class models (e.g. NLI 3-class)
     logits = outputs.logits.squeeze()
     if logits.dim() == 0:
-        raw_logit    = logits.item()
-        prob_dup     = float(torch.sigmoid(logits).item())
+        raw_logit = logits.item()
+        prob_dup  = float(torch.sigmoid(logits).item())
     else:
-        # Lấy class cuối (thường là entailment/match/duplicate)
-        raw_logit    = logits[-1].item()
-        prob_dup     = float(torch.softmax(logits, dim=-1)[-1].item())
+        # Last class is typically entailment / match / duplicate
+        raw_logit = logits[-1].item()
+        prob_dup  = float(torch.softmax(logits, dim=-1)[-1].item())
 
-    # Lấy attention layer cuối, average qua mọi head — giữ đúng tinh
-    # thần "trích xuất attention matrix, mọi layer, mọi head" nhưng
-    # dùng layer cuối làm đại diện (layer cuối thường mang tín hiệu
-    # ngữ nghĩa rõ nhất cho classification head).
-    attentions = outputs.attentions  # tuple(num_layers) of (1, num_heads, seq, seq)
-    last_layer_attn = attentions[-1][0]            # (num_heads, seq, seq)
-    avg_attn = last_layer_attn.mean(dim=0)          # (seq, seq) — average qua head
+    # Last attention layer averaged across all heads.
+    # The last layer carries the strongest semantic signal for the classification head.
+    attentions      = outputs.attentions          # tuple of (1, num_heads, seq, seq)
+    last_layer_attn = attentions[-1][0]           # (num_heads, seq, seq)
+    avg_attn        = last_layer_attn.mean(dim=0) # (seq, seq)
 
     input_ids = inputs["input_ids"][0]
-    tokens = tokenizer.convert_ids_to_tokens(input_ids)
-    n_tokens = int(inputs["attention_mask"][0].sum().item())
+    tokens    = tokenizer.convert_ids_to_tokens(input_ids)
+    n_tokens  = int(inputs["attention_mask"][0].sum().item())
 
-    sep_token_id = tokenizer.sep_token_id
+    sep_token_id  = tokenizer.sep_token_id
     sep_positions = (input_ids == sep_token_id).nonzero(as_tuple=True)[0]
-    sep_idx = int(sep_positions[0].item()) if len(sep_positions) > 0 else n_tokens // 2
+    sep_idx       = int(sep_positions[0].item()) if len(sep_positions) > 0 else n_tokens // 2
 
     cov_a_to_b, cov_b_to_a = _max_alignment_coverage(avg_attn, sep_idx, n_tokens)
     nis = _novel_information_score(avg_attn, sep_idx, n_tokens)
@@ -226,8 +226,9 @@ def score_pair(text_a: str, text_b: str) -> dict:
         "coverage_a_to_b":  round(cov_a_to_b, 4),
         "coverage_b_to_a":  round(cov_b_to_a, 4),
         "nis_b_given_a":    nis,
-        # attention_matrix và tokens disabled — heatmap off, không cần serialize
-        # Uncomment khi cần vẽ heatmap phân tích:
+        # attention_matrix and token lists disabled — heatmap off, avoids
+        # serialising large numpy arrays during benchmarking.
+        # Uncomment for visual analysis:
         # "attention_matrix": avg_attn[:n_tokens, :n_tokens].cpu().numpy(),
         # "tokens_a":         tokens[1:sep_idx],
         # "tokens_b":         tokens[sep_idx + 1:n_tokens - 1],
@@ -244,24 +245,34 @@ def score_candidates_batched(
     chunk_level: str | None = None,
 ) -> list[dict]:
     """
-    Batch version của score_candidates — gom tất cả K candidates thành
-    1 forward pass duy nhất thay vì K lần riêng lẻ.
+    Batch version of score_candidates — tokenises all K candidates together
+    and runs a single forward pass instead of K sequential passes.
 
-    Trên GPU: 1 batch forward pass tận dụng parallelism của GPU tốt hơn
-    K lần sequential rất nhiều. Với K=5 và GPU mạnh, speedup ~3-4x.
+    On GPU a single batched forward pass utilises parallelism far better than
+    K sequential calls; expected speedup ~3-4x for K=5.
 
-    Vẫn xử lý đầy đủ:
-      - Strip contextual header trước khi score
-      - Skip parent-child pairs
-      - Tính NIS từ attention của từng cặp (attention không share được
-        giữa các cặp nên vẫn cần xử lý riêng, nhưng forward pass được batch)
+    Handles:
+      - Stripping the contextual header before scoring.
+      - Skipping parent-child pairs (no forward pass for those).
+      - Computing NIS from the per-pair attention sub-matrix
+        (attention is not shared across pairs, so per-pair extraction
+        still runs inside the loop, but the GPU kernel is batched).
+
+    Input:
+        chunk_text     : text of the new chunk (A).
+        candidates     : list of candidate dicts from Stage 1.
+        chunk_parent_id: parent_id of the new chunk (for HPC guard).
+        chunk_level    : level field of the new chunk (for HPC guard).
+
+    Returns:
+        list of candidate dicts, each extended with scoring fields
+        (prob_duplicate, nis_b_given_a, coverage_*, skipped, skip_reason).
     """
     tokenizer, model = get_cross_encoder()
     text_a_clean = _strip_contextual_header(chunk_text)
 
-    # Phân loại candidates: skip vs score
     to_score: list[tuple[int, dict]] = []   # (original_idx, candidate)
-    results: list[dict] = []
+    results:  list[dict]             = []
 
     for i, cand in enumerate(candidates):
         if _is_parent_child_pair(
@@ -270,9 +281,12 @@ def score_candidates_batched(
             cand.get("chunk_id", ""),
         ):
             results.append({**cand,
-                "skipped": True, "skip_reason": "parent_child_pair",
-                "prob_duplicate": 0.0, "nis_b_given_a": 1.0,
-                "raw_logit": 0.0, "coverage_a_to_b": 0.0,
+                "skipped":        True,
+                "skip_reason":    "parent_child_pair",
+                "prob_duplicate": 0.0,
+                "nis_b_given_a":  1.0,
+                "raw_logit":      0.0,
+                "coverage_a_to_b": 0.0,
                 "coverage_b_to_a": 0.0,
             })
         else:
@@ -282,7 +296,7 @@ def score_candidates_batched(
     if not to_score:
         return results
 
-    # Tokenize tất cả cặp cùng lúc — 1 batch
+    # Tokenise all pairs at once — single batch
     texts_b = [_strip_contextual_header(cand["text"]) for _, cand in to_score]
     texts_a  = [text_a_clean] * len(texts_b)
 
@@ -291,25 +305,23 @@ def score_candidates_batched(
         return_tensors="pt",
         truncation=True,
         max_length=256,
-        padding=True,   # pad về cùng độ dài trong batch
+        padding=True,   # pad to the same length within the batch
     ).to(DEVICE)
 
     outputs = model(**inputs)
 
-    # Xử lý từng kết quả trong batch
     logits_batch    = outputs.logits          # (batch, num_labels)
     attentions_last = outputs.attentions[-1]  # (batch, num_heads, seq, seq)
 
     for batch_i, (orig_i, cand) in enumerate(to_score):
         logits = logits_batch[batch_i]
         if logits.dim() == 0 or logits.shape[0] == 1:
-            prob_dup = float(torch.sigmoid(logits.squeeze()).item())
+            prob_dup  = float(torch.sigmoid(logits.squeeze()).item())
             raw_logit = logits.squeeze().item()
         else:
             prob_dup  = float(torch.softmax(logits, dim=-1)[-1].item())
             raw_logit = logits[-1].item()
 
-        # Attention của cặp này trong batch
         avg_attn = attentions_last[batch_i].mean(dim=0)  # (seq, seq)
 
         input_ids = inputs["input_ids"][batch_i]
@@ -323,13 +335,13 @@ def score_candidates_batched(
 
         results[orig_i] = {
             **cand,
-            "skipped":        False,
-            "skip_reason":    "",
-            "raw_logit":      round(raw_logit, 4),
-            "prob_duplicate": round(prob_dup, 4),
+            "skipped":         False,
+            "skip_reason":     "",
+            "raw_logit":       round(raw_logit, 4),
+            "prob_duplicate":  round(prob_dup, 4),
             "coverage_a_to_b": round(cov_a2b, 4),
             "coverage_b_to_a": round(cov_b2a, 4),
-            "nis_b_given_a":  nis,
+            "nis_b_given_a":   nis,
         }
 
     return results
@@ -342,8 +354,8 @@ def score_candidates(
     chunk_level: str | None = None,
 ) -> list[dict]:
     """
-    Wrapper gọi score_candidates_batched — giữ nguyên interface cũ
-    để stage3_decision.py không cần sửa.
+    Wrapper around score_candidates_batched.
+    Preserves the original interface so stage3_decision.py requires no changes.
     """
     return score_candidates_batched(
         chunk_text, candidates, chunk_parent_id, chunk_level,
@@ -352,15 +364,17 @@ def score_candidates(
 
 import re as _re
 
+
 def _strip_contextual_header(text: str) -> str:
     """
-    Loại bỏ header [Context: ... ] do Contextual chunker prepend.
-    Ví dụ: "[Context: Super Bowl 50 | Part 3/12] The game was..."
-         → "The game was..."
+    Remove the [Context: ... ] header prepended by the Contextual chunker.
 
-    Nếu không có header → trả về text nguyên vẹn.
-    Text gốc trong Qdrant KHÔNG bị thay đổi — chỉ strip khi đưa vào
-    cross-encoder để tránh false-redundancy do header giống nhau.
+    Example:
+      "[Context: Super Bowl 50 | Part 3/12] The game was..." => "The game was..."
+
+    If no header is present, returns the text unchanged.
+    The original text stored in Qdrant is NOT modified — stripping happens
+    only before scoring to prevent false redundancy from identical headers.
     """
     return _re.sub(r'^\[Context:[^\]]*\]\s*', '', text).strip()
 
@@ -373,32 +387,28 @@ def _is_parent_child_pair(
     cand_chunk_id:    str,
 ) -> bool:
     """
-    Trả về True nếu chunk mới và candidate là cặp parent-child trong
-    HierarchicalParentChild — tức là KHÔNG NÊN so sánh dedup vì chúng
-    overlap theo thiết kế, không phải vì nội dung trùng lặp thật sự.
+    Return True if the new chunk and the candidate form a parent-child pair
+    in HierarchicalParentChild chunking.
 
-    Các trường hợp skip:
-      1. chunk là child, candidate là parent của nó
-         (chunk_parent_id == cand_chunk_id)
-      2. chunk là parent, candidate là child của nó
-         (cand_parent_id == chunk của chúng ta — không có chunk_id
-          ở đây nhưng có thể kiểm tra qua level)
-      3. Cả 2 đều là child của cùng 1 parent
-         (chunk_parent_id == cand_parent_id, cả 2 đều có parent_id)
+    Parent-child pairs overlap by design, not because of genuine content
+    duplication, and must not be compared by the dedup scorer.
+
+    Cases that trigger a skip:
+      1. New chunk is a child whose parent is the candidate:
+         chunk_parent_id == cand_chunk_id
+      2. New chunk is a parent and the candidate is one of its children:
+         chunk_level == "parent" and cand_parent_id is set
+      3. Both are sibling children of the same parent:
+         => NOT skipped; siblings may genuinely duplicate each other
+            (small chunk_size + overlap) and should be processed normally.
     """
-    # Trường hợp 1: chunk là child, candidate là parent của nó
+    # Case 1: new chunk is a child; candidate is its parent
     if chunk_parent_id and chunk_parent_id == cand_chunk_id:
         return True
 
-    # Trường hợp 2: chunk là parent (level="parent"), candidate là child của nó
+    # Case 2: new chunk is a parent; candidate is one of its children
     if chunk_level == "parent" and cand_parent_id:
-        # candidate có parent_id → đây là child; nếu cùng doc thì skip
-        # (không có chunk_id của chunk mới ở đây, dùng heuristic doc-level)
         if cand_parent_id.startswith(chunk_parent_id or "___NOMATCH___"):
             return True
-
-    # Trường hợp 3: cả 2 là sibling child của cùng 1 parent
-    # → KHÔNG skip: 2 child chunks có thể thực sự trùng lặp nội dung
-    # nếu chunk_size nhỏ và có overlap → để CACD xử lý bình thường
 
     return False
