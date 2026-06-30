@@ -1,91 +1,97 @@
 # cacd-dedup
 
-**Cross-Attention Calibrated Deduplication (CACD)** — một phương pháp chunk-filtering mới cho RAG, thay thế cosine-similarity threshold cố định bằng cross-encoder + calibrated probability.
+**Cross-Attention Calibrated Deduplication (CACD)** — a chunk-filtering method for RAG that replaces fixed cosine-similarity thresholds with a cross-encoder pipeline producing a calibrated decision signal.
 
-Project độc lập, tách riêng khỏi `rag-bench-v4`. Giữ nguyên 5 chunking strategies để đánh giá, nhưng thay toàn bộ 5 filter methods cũ (NoFilter / ExactNorm / MinHashLSH / Similarity / NERExact) bằng **một pipeline duy nhất: CACD**.
+Standalone project, separated from `rag-bench-v4`. Keeps the same chunking strategies for evaluation, but replaces all 5 of the paper's filter methods (NoFilter / ExactNorm / MinHashLSH / Similarity / NERExact) with a single pipeline: **CACD**.
 
 ---
 
-## 1. Vấn đề CACD giải quyết
+## 1. Problem CACD addresses
 
-Cosine similarity trên pooled embedding chỉ cho ra **1 con số duy nhất** để quyết định 2 chunk có trùng lặp hay không, so với **1 threshold cố định** (thường là 0.8) không có cơ sở khoa học rõ ràng. Thực nghiệm trên `rag-bench-v4` (500 SQuAD documents) cho thấy hệ quả cụ thể:
+Cosine similarity on pooled embeddings reduces the "are these two chunks duplicates?" question to a single number compared against a fixed threshold (typically 0.8) with no principled justification. Benchmarking on `rag-bench-v4` (500 SQuAD documents) showed the concrete consequence:
 
-| Filter cũ | Strategy bị ảnh hưởng | Recall delta |
+| Filter | Strategy affected | Recall delta |
 |---|---|---|
 | NERExact | Contextual | **-0.143** |
 | NERExact | TopicBased | **-0.131** |
 
-Nguyên nhân: chunk có header/entity giống nhau bề ngoài (do cấu trúc chunking) bị filter nhầm coi là "trùng lặp", dù nội dung thực tế khác nhau — gọi là **false redundancy**.
+Cause: chunks that look superficially similar (shared header text, shared named entities introduced by the chunking structure itself) get flagged as "duplicates" even though their actual content differs — a failure mode referred to here as **false redundancy**.
 
-CACD giải quyết bằng cách:
-1. Dùng **cross-encoder** (joint encoding, không phải 2 vector độc lập) để giữ chi tiết token-to-token tới tận bước so sánh cuối.
-2. Trích xuất **attention matrix** thay vì 1 con số similarity duy nhất — biết chính xác phần nào của 2 chunk thực sự "khớp" với nhau.
-3. Output một **calibrated probability** (không phải threshold đoán mò) — quyết định dựa trên Bayes-optimal cutoff suy ra từ tỷ lệ chi phí, không phải hằng số tùy tiện.
+CACD addresses this by:
+1. Using a **cross-encoder** (joint encoding of both chunks, not two independent vectors) to preserve token-level detail all the way to the final comparison step.
+2. Extracting the **attention matrix** instead of collapsing to a single similarity score — this identifies exactly which parts of the two chunks actually correspond to each other.
+3. Producing two complementary signals — a **calibrated duplicate probability** from the cross-encoder output, and a **Novel Information Score (NIS)** derived from attention entropy — combined through a 3-zone decision rule plus a length-aware guard, rather than a single hand-picked constant.
 
 ---
 
-## 2. Pipeline CACD (4 stages)
+## 2. CACD Pipeline (4 stages)
 
 ```
-Chunk mới
-    │
-    ▼
+New chunk
+    |
+    v
 Stage 0 — Embedding
-    all-MiniLM-L6-v2, vector 384 chiều
-    │
-    ▼
+    all-MiniLM-L6-v2, 384-dim vector
+    |
+    v
 Stage 1 — Coarse retrieval (HNSW, batch query)
-    Tìm top-K ứng viên gần nhất ĐÃ TỒN TẠI trong Qdrant
-    (persistent index — không reset giữa các lần ingest)
-    Độ phức tạp: O(m log n)
-    │
-    ▼  (chỉ K ứng viên, K=5 mặc định)
+    Retrieves top-K nearest neighbours already present in Qdrant
+    (persistent index — not reset between ingest batches)
+    Complexity: O(m log n)
+    |
+    v  (only K candidates, K=5 by default)
 Stage 2 — Cross-attention redundancy scoring
-    2a. Joint encoding: [CLS] chunk_mới [SEP] candidate [SEP]
-    2b. Trích xuất attention matrix (layer cuối, average qua head)
-    2c. Tổng hợp redundancy signal (max-alignment kiểu BERTScore)
-    2d. Output calibrated probability P(duplicate)
-    Model: cross-encoder/msmarco-MiniLM-L6-en-de-v1 (pretrained, không fine-tune)
-    │
-    ▼
-Stage 3 — Quyết định threshold-free (CHỈ nhánh DROP)
-    cutoff = Bayes-optimal, suy ra từ cost_FP / (cost_FP + cost_FN)
-    P(duplicate) > cutoff  →  Bỏ qua, không insert
-    Ngược lại               →  Insert vào Qdrant
+    2a. Joint encoding: [CLS] new_chunk [SEP] candidate [SEP]
+    2b. Extract attention matrix (last layer, averaged across heads)
+    2c. Compute coverage signals (max-alignment, BERTScore-style)
+    2d. Compute Novel Information Score (NIS) from attention B=>A entropy
+    Model: cross-encoder/msmarco-MiniLM-L6-en-de-v1 (pretrained, no fine-tuning)
+    Batched forward pass: all K candidates scored in a single GPU call.
+    |
+    v
+Stage 3 — 3-zone decision + length-aware guard
+    prob >= PROB_HIGH                => DROP (unless length guard applies)
+    prob <= PROB_LOW                 => KEEP
+    PROB_LOW < prob < PROB_HIGH      => NIS decides (NIS < threshold => DROP)
+    chunk longer than LENGTH_GUARD chars is protected unless NIS < NIS_FLOOR
 ```
 
-**Lưu ý phạm vi**: Bản triển khai này **chỉ có nhánh Drop**, không có Merge. Việc so sánh Drop vs Merge (đánh giá trade-off tốc độ vs độ chính xác) để dành cho experiment sau.
+**Scope note**: this implementation only has a DROP branch — there is no Merge step. A chunk identified as redundant is excluded from the index entirely; partial-overlap cases (two chunks sharing roughly half their content) are resolved by keeping one and dropping the other rather than merging the non-overlapping portions. Comparing Drop vs. Merge is left for future work.
 
 ---
 
-## 3. Chunking Strategies (giữ nguyên từ rag-bench-v4)
+## 3. Chunking Strategies
 
-| Strategy | Configs | Nguyên lý |
+| Strategy | Configs | Mechanism |
 |---|---|---|
-| AdaptiveEntropy | size=300, size=500 | Chunk size co giãn theo Shannon entropy |
-| AdaptiveSentenceLen | target=4, target=6 câu | Chunk size co giãn theo độ dài câu trung bình |
-| HierarchicalParentChild | child=200/parent=600, child=400/parent=800 | 2 tầng parent+child, cả 2 đều index |
-| Contextual | size=300, size=500 | Prepend header `[Context: title | Part i/n]` |
-| TopicBased | n_topics=4, n_topics=6 | K-means clustering trên sentence embeddings |
+| FixedSize | size=200, size=400 | Fixed-length character windows |
+| Recursive | size=200, size=400 | Paragraph => sentence => space => character split |
+| Semantic | size=200, size=400 | Sequential breakpoint via cosine-distance percentile |
+| Overlapping | size=400/overlap=200, size=800/overlap=400 | Sliding window, word-boundary aligned |
+| AdaptiveEntropy | size=300, size=500 | Chunk size adapts to Shannon entropy |
+| AdaptiveSentenceLen | target=4, target=6 sentences | Chunk size adapts to mean sentence length |
+| HierarchicalParentChild | child=200/parent=600, child=400/parent=800 | Two-level parent+child, both indexed |
+| Contextual | size=300, size=500 | Prepends header `[Context: title \| Part i/n]` |
+| TopicBased | n_topics=4, n_topics=6 | K-means clustering on sentence embeddings |
 
-→ **10 configs tổng** (5 strategies × 2 size variants), mỗi config chạy qua đúng 1 pipeline CACD.
+=> **18 configs total** (9 strategies x 2 size variants), each running through the same CACD pipeline.
 
 ---
 
-## 4. Evaluation Metrics (giữ nguyên từ rag-bench-v4)
+## 4. Evaluation Metrics
 
-| Metric | Công thức |
+| Metric | Formula |
 |---|---|
 | Precision | \|Te ∩ Tr\| / \|Tr\| |
 | Recall | \|Te ∩ Tr\| / \|Te\| |
 | IoU | \|Te ∩ Tr\| / \|Te ∪ Tr\| |
 | Index Size | chunk_count_after_filter + storage_mb |
 
-Tính trên cả 2 chế độ tokenization: `raw` (lowercase) và `preprocessed` (bỏ stopword + lemmatize).
+Computed under two tokenization modes: `raw` (lowercase word tokens) and `preprocessed` (stopword removal + lemmatization via spaCy).
 
 ---
 
-## 5. Cài đặt và chạy
+## 5. Setup and usage
 
 ### 5.1 Setup
 
@@ -97,11 +103,11 @@ pip install -r requirements.txt
 python -m spacy download en_core_web_sm
 ```
 
-Lần chạy đầu tiên sẽ tự động tải về:
+The first run downloads:
 - `sentence-transformers/all-MiniLM-L6-v2` (~80MB) — Stage 0
 - `cross-encoder/msmarco-MiniLM-L6-en-de-v1` (~90MB) — Stage 2
 
-### 5.2 Verify cài đặt
+### 5.2 Verify installation
 
 ```bash
 python -c "from sentence_transformers import SentenceTransformer; m = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2'); print('embed OK:', m.encode(['test']).shape)"
@@ -110,20 +116,20 @@ python -c "from qdrant_client import QdrantClient; c = QdrantClient(':memory:');
 python -c "import torch; print('GPU available:', torch.cuda.is_available())"
 ```
 
-### 5.3 Chạy benchmark
+### 5.3 Run benchmark
 
 ```bash
-# Debug nhỏ (20 docs, 30 questions)
+# Quick debug (20 docs, 30 questions)
 python scripts/benchmark.py --max-docs 20 --max-questions 30
 
-# Một strategy cụ thể — đề xuất bắt đầu với Contextual (case "khó nhất"
-# nơi NERExact baseline cũ bị phá hỏng nặng nhất, -0.143 Recall)
+# Single strategy — Contextual is a good starting point: it is the case
+# where the old NERExact baseline degraded Recall the most (-0.143)
 python scripts/benchmark.py --strategy Contextual --max-docs 50 --max-questions 50
 
-# Một config cụ thể
+# Single config
 python scripts/benchmark.py --config "Contextual_300_0"
 
-# Full benchmark (toàn bộ 10 configs)
+# Full benchmark (all 18 configs)
 python scripts/benchmark.py
 
 # Background run
@@ -131,16 +137,16 @@ nohup python scripts/benchmark.py > results/bench.log 2>&1 &
 tail -f results/bench.log
 ```
 
-### 5.4 Xem kết quả
+### 5.4 Inspect results
 
 ```bash
-# Xem CSV kết quả
+# View the results CSV
 column -t -s',' results/benchmark_results.csv | less -S
 
-# Xem audit log (quyết định drop/keep cho từng chunk, kèm P(duplicate))
+# View the audit log (drop/keep decision for each chunk, with P(duplicate) and NIS)
 column -t -s',' results/audit_Contextual_300_0.csv | less -S
 
-# Xem heatmap attention (phân tích trực quan đoạn nào trùng)
+# View attention heatmaps (disabled by default — see Section 8)
 open results/heatmaps/Contextual_300_0/   # macOS
 xdg-open results/heatmaps/Contextual_300_0/  # Linux
 ```
@@ -149,58 +155,60 @@ xdg-open results/heatmaps/Contextual_300_0/  # Linux
 
 ## 6. Output
 
-### `results/benchmark_results.csv` — 1 row / config
+### `results/benchmark_results.csv` — one row per config
 
-| Column | Mô tả |
+| Column | Description |
 |---|---|
-| `config_name` | vd. `Contextual_300_0` |
-| `chunk_count_before_filter` / `chunk_count_after_filter` | Số chunk trước/sau CACD dedup |
-| `filter_reduction_pct` | % chunk bị drop |
-| `ingest_time_s` | Tổng thời gian chunk + CACD (4 stages) + upsert |
-| `storage_mb` / `storage_du` | Dung lượng collection Qdrant |
+| `config_name` | e.g. `Contextual_300_0` |
+| `chunk_count_before_filter` / `chunk_count_after_filter` | Chunk count before/after CACD dedup |
+| `filter_reduction_pct` | Percentage of chunks dropped |
+| `ingest_time_s` | Total time: chunking + CACD (4 stages) + upsert |
+| `storage_mb` / `storage_du` | Qdrant collection disk size |
 | `precision_raw` / `recall_raw` / `iou_raw` | Token metrics, raw mode |
 | `precision_pre` / `recall_pre` / `iou_pre` | Token metrics, preprocessed mode |
-| `cacd_cutoff_used` | Bayes-optimal cutoff thực tế đã dùng |
+| `cacd_prob_high` / `cacd_prob_low` / `cacd_nis_threshold` | Decision thresholds actually used for this run |
 
-### `results/audit_{config_name}.csv` — 1 row / chunk
+### `results/audit_{config_name}.csv` — one row per chunk
 
-Ghi lại quyết định CACD cho từng chunk: `decision` (drop/keep), `best_p_duplicate`, `best_candidate_id`, `coverage_a_to_b`, `coverage_b_to_a`, `attn_entropy`.
+Records the CACD decision for each chunk: `decision` (drop/keep), `reason` (which zone/guard triggered the decision), `best_p_duplicate`, `best_candidate_id`, `nis_b_given_a`, `coverage_a_to_b`, `coverage_b_to_a`, `redundancy_signal`.
 
 ### `results/heatmaps/{config_name}/*.png`
 
-Heatmap attention matrix giữa chunk mới và candidate gần nhất — trục X là candidate (B), trục Y là chunk mới (A), màu càng đậm = attention weight càng cao. Tối đa 30 heatmap/config (giới hạn `max_heatmaps` trong `stage3_decision.py`).
+Attention-matrix heatmap between a new chunk and its nearest candidate — X axis is the candidate (B), Y axis is the new chunk (A); darker cells indicate higher attention weight. Disabled by default to reduce ingest time (see `save_heatmap` in `stage3_decision.py`, commented out at the call site); uncomment to re-enable, up to `max_heatmaps` per config.
 
 ---
 
-## 7. Cấu trúc project
+## 7. Project structure
 
 ```
 cacd-dedup/
 ├── configs/
-│   └── settings.py              # Tham số CACD + 10 chunking configs
+│   └── settings.py              # CACD parameters + 18 chunking configs
 ├── src/
 │   ├── ingestion/
 │   │   ├── loader.py            # SQuAD 1.1 loader
-│   │   ├── chunker.py           # 5 chunking strategies (giữ nguyên từ v4)
-│   │   ├── embedder.py          # all-MiniLM-L6-v2 (Stage 0)
+│   │   ├── chunker.py           # 9 chunking strategies
+│   │   ├── embedder.py          # all-MiniLM-L6-v2 (Stage 0, GPU-aware)
 │   │   └── vector_store.py      # Qdrant embedded — persistent index
-│   ├── dedup/                   # ★ Module mới — thay thế filtering/
+│   ├── dedup/
 │   │   ├── stage1_coarse_retrieval.py   # Batch HNSW query
-│   │   ├── stage2_cross_attention.py    # Cross-encoder + attention extraction
-│   │   ├── calibration.py               # Calibrated probability + Bayes cutoff
-│   │   └── stage3_decision.py           # Drop/keep decision + heatmap
+│   │   ├── stage2_cross_attention.py    # Cross-encoder + attention extraction (batched)
+│   │   ├── calibration.py               # Bayes-optimal cutoff
+│   │   └── stage3_decision.py           # 3-zone decision + length-aware guard
 │   ├── retrieval/
-│   │   └── retriever.py         # Dense cosine retrieval (đánh giá cuối)
+│   │   └── retriever.py         # Dense cosine retrieval (final evaluation)
 │   ├── evaluation/
 │   │   └── metrics.py           # Precision/Recall/IoU
 │   └── utils/
 │       └── logger.py
 ├── scripts/
-│   └── benchmark.py             # CLI chính
+│   ├── benchmark.py                      # Main CLI
+│   ├── experiment_calibration.py         # 5-pair sanity check (no benchmark dependency)
+│   └── experiment_model_comparison.py    # 37-model cross-encoder comparison
 ├── data/
 │   └── qdrant_storage/          # Qdrant collections
 ├── results/
-│   ├── heatmaps/                # Attention heatmap PNG theo từng config
+│   ├── heatmaps/                # Attention heatmap PNGs per config (disabled by default)
 │   ├── benchmark_results.csv
 │   ├── per_question_*.csv
 │   └── audit_*.csv
@@ -210,9 +218,10 @@ cacd-dedup/
 
 ---
 
-## 8. Giới hạn của bản triển khai hiện tại
+## 8. Known limitations
 
-- **Chỉ có nhánh Drop**, chưa có Merge. Trường hợp "partial overlap" (2 chunk trùng 50% nội dung, mỗi bên còn 50% thông tin riêng) sẽ bị xử lý nhị phân (drop 1, giữ 1) — có rủi ro mất thông tin riêng của chunk bị drop. Đây là giới hạn đã biết, để dành cho experiment Merge sau.
-- **Cross-encoder pretrained, không fine-tune** — `ms-marco-MiniLM-L-6-v2` được train cho passage relevance ranking (MS MARCO), không phải binary duplicate classification. Calibration hiện tại dùng z-score + sigmoid trên phân phối logit quan sát được (`RunningLogitCalibrator`), không phải calibration đã được chứng minh chính xác tuyệt đối (cần dữ liệu có nhãn để calibrate chuẩn).
-- **Stage 1 không dùng GPU song song hóa thật** trong môi trường hiện tại — kiến trúc batch-query vẫn giữ nguyên, có thể nâng cấp lên cuVS/FAISS-GPU sau mà không đổi logic.
-- **Stage 2 xử lý tuần tự từng chunk** (không batch cross-encoder calls) — đây là điểm có thể tối ưu thêm nếu cần tăng tốc.
+- **DROP branch only, no Merge.** Partial-overlap cases (two chunks sharing roughly 50% of their content) are resolved binarily — one chunk is kept, the other dropped — risking loss of the unique information in the dropped chunk. This is a known limitation reserved for a future Merge experiment.
+- **Cross-encoder is pretrained, not fine-tuned.** `msmarco-MiniLM-L6-en-de-v1` was trained for passage relevance ranking (MS MARCO), not binary duplicate classification. The model was selected via a 37-model comparison experiment (`scripts/experiment_model_comparison.py`) rather than fine-tuned on labeled duplicate pairs.
+- **NIS_DROP_THRESHOLD saturates at 0.8 on SQuAD.** Values from 0.8 to 0.9 produce identical results because `LENGTH_GUARD` (300 characters) controls the majority of decisions once the probability threshold is satisfied. This has not been validated on datasets with different chunk-length distributions.
+- **Heatmap generation is disabled by default** to reduce ingest time; re-enabling it (see Section 6) adds meaningful overhead per chunk during ingest.
+- **Stage 1 (HNSW via Qdrant) runs on CPU only** — no GPU-accelerated ANN backend (e.g. cuVS/FAISS-GPU) is wired in, though the batch-query architecture would support one without changing the decision logic.
