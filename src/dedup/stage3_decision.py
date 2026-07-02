@@ -239,49 +239,77 @@ def run_cacd_dedup(
             })
             continue
 
-        # Select the candidate with the highest prob_duplicate.
-        best = max(valid_scored, key=lambda s: s["prob_duplicate"])
-
-        # Stage 3 — 3-zone decision.
+        # Stage 3 — Early-exit majority voting across K candidates.
         #
-        # Zone 1 (prob >= PROB_HIGH): model is confident => DROP,
-        #   but honour the length-aware guard: if the chunk is long and
-        #   NIS > NIS_FLOOR, keep it anyway (long chunks are likely to
-        #   contain unique information not present in the candidate).
+        # Each valid candidate votes independently DROP or KEEP using the
+        # same 3-zone decision rule + length-aware guard as before.
+        # Voting stops as soon as one side reaches ceil(K/2) votes.
         #
-        # Zone 2 (prob <= PROB_LOW): model is confident => KEEP immediately.
-        #
-        # Zone 3 (uncertainty): NIS decides.
-        #   NIS < NIS_DROP_THRESHOLD => DROP (B has little novel information).
-        #   NIS >= NIS_DROP_THRESHOLD => KEEP (B carries enough new information).
-        #   Length guard also applies in Zone 3.
+        # Rationale: the original design dropped a chunk whenever the single
+        # highest-scoring candidate triggered DROP, even if K-1 other
+        # candidates all voted KEEP. A single Stage 1 retrieval artifact
+        # (a false positive from HNSW) could therefore cause a false drop.
+        # Majority voting requires genuine consensus before committing to DROP.
 
-        prob      = best["prob_duplicate"]
-        nis       = best["nis_b_given_a"]
-        chunk_len = len(chunk["text"])
+        import math
+        chunk_len  = len(chunk["text"])
+        majority   = math.ceil(len(valid_scored) / 2)
+        votes_drop = 0
+        votes_keep = 0
+        decision   = None
+        reason     = ""
+        best       = None   # candidate that cast the deciding vote
 
-        if prob >= PROB_HIGH:
-            if chunk_len > LENGTH_GUARD and nis > NIS_FLOOR:
-                decision = "keep"
-                reason   = f"length_guard ({chunk_len}chars > {LENGTH_GUARD}, nis={nis:.3f})"
-            else:
-                decision = "drop"
-                reason   = f"prob_high ({prob:.3f} >= {PROB_HIGH})"
-        elif prob <= PROB_LOW:
-            decision = "keep"
-            reason   = f"prob_low ({prob:.3f} <= {PROB_LOW})"
-        else:
-            # Uncertainty zone => NIS decides
-            if nis < NIS_DROP_THRESHOLD:
-                if chunk_len > LENGTH_GUARD:
-                    decision = "keep"
-                    reason   = f"length_guard_uncertainty ({chunk_len}chars, nis={nis:.3f})"
+        for cand in valid_scored:
+            prob = cand["prob_duplicate"]
+            nis  = cand["nis_b_given_a"]
+
+            # Same 3-zone + length-aware guard logic as before, applied per candidate
+            if prob >= PROB_HIGH:
+                if chunk_len > LENGTH_GUARD and nis > NIS_FLOOR:
+                    vote        = "keep"
+                    vote_reason = f"length_guard ({chunk_len}chars > {LENGTH_GUARD}, nis={nis:.3f})"
                 else:
-                    decision = "drop"
-                    reason   = f"nis_low ({nis:.3f} < {NIS_DROP_THRESHOLD}, prob={prob:.3f})"
+                    vote        = "drop"
+                    vote_reason = f"prob_high ({prob:.3f} >= {PROB_HIGH})"
+            elif prob <= PROB_LOW:
+                vote        = "keep"
+                vote_reason = f"prob_low ({prob:.3f} <= {PROB_LOW})"
             else:
+                if nis < NIS_DROP_THRESHOLD:
+                    if chunk_len > LENGTH_GUARD:
+                        vote        = "keep"
+                        vote_reason = f"length_guard_uncertainty ({chunk_len}chars, nis={nis:.3f})"
+                    else:
+                        vote        = "drop"
+                        vote_reason = f"nis_low ({nis:.3f} < {NIS_DROP_THRESHOLD}, prob={prob:.3f})"
+                else:
+                    vote        = "keep"
+                    vote_reason = f"nis_high ({nis:.3f} >= {NIS_DROP_THRESHOLD}, prob={prob:.3f})"
+
+            if vote == "drop":
+                votes_drop += 1
+            else:
+                votes_keep += 1
+
+            # Early exit: first side to reach majority wins
+            if votes_drop >= majority:
+                decision = "drop"
+                reason   = f"voting_drop ({votes_drop}/{len(valid_scored)} >= {majority}) | deciding: {vote_reason}"
+                best     = cand
+                break
+            if votes_keep >= majority:
                 decision = "keep"
-                reason   = f"nis_high ({nis:.3f} >= {NIS_DROP_THRESHOLD}, prob={prob:.3f})"
+                reason   = f"voting_keep ({votes_keep}/{len(valid_scored)} >= {majority}) | deciding: {vote_reason}"
+                best     = cand
+                break
+
+        # Fallback: no majority reached (e.g. only 1 candidate after guard filtering)
+        # => default KEEP to avoid silent data loss
+        if decision is None:
+            decision = "keep"
+            reason   = f"voting_no_majority (drop={votes_drop}, keep={votes_keep}) => default keep"
+            best     = valid_scored[-1]
 
         # Heatmap saving is disabled to reduce ingest time.
         # Uncomment for visual analysis:
