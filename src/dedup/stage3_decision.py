@@ -69,6 +69,24 @@ NIS_DROP_THRESHOLD = 0.8
 LENGTH_GUARD = 300   # characters
 NIS_FLOOR    = 0.3   # absolute floor: NIS < NIS_FLOOR => drop even if chunk is long
 
+# Weighted-score threshold for Stage 3 decision.
+#
+# weight_drop = prob_dup * (1 - NIS)
+#
+# This product captures the JOINT signal: high only when the cross-encoder
+# is confident it is a duplicate (prob_dup high) AND attention confirms the
+# candidate explains the new chunk (NIS low). Topic-similar but content-
+# different chunks (e.g. TopicBased strategy) have high prob_dup but also
+# high NIS, yielding a low weight_drop — correctly surviving the filter.
+#
+# Threshold 0.3 derived from empirical case analysis:
+#   True duplicate:           weight ≈ 0.80–0.95 → DROP
+#   Paraphrase duplicate:     weight ≈ 0.70–0.80 → DROP
+#   Partial overlap 70%:      weight ≈ 0.47      → DROP
+#   Partial overlap 50%:      weight ≈ 0.26      → KEEP
+#   TopicBased false positive: weight ≈ 0.06     → KEEP
+WEIGHT_THRESHOLD = 0.3
+
 
 def save_heatmap(
     score_result: dict,
@@ -239,77 +257,81 @@ def run_cacd_dedup(
             })
             continue
 
-        # Stage 3 — Early-exit majority voting across K candidates.
+        # Stage 3 — Weighted-score decision across K candidates.
         #
-        # Each valid candidate votes independently DROP or KEEP using the
-        # same 3-zone decision rule + length-aware guard as before.
-        # Voting stops as soon as one side reaches ceil(K/2) votes.
+        # Problem with binary voting: both prob_dup AND NIS are high for
+        # TopicBased false positives (same topic, different facts). Binary
+        # voting treats a high prob_dup as a DROP vote regardless of NIS,
+        # causing false drops on topic-similar but content-different chunks.
         #
-        # Rationale: the original design dropped a chunk whenever the single
-        # highest-scoring candidate triggered DROP, even if K-1 other
-        # candidates all voted KEEP. A single Stage 1 retrieval artifact
-        # (a false positive from HNSW) could therefore cause a false drop.
-        # Majority voting requires genuine consensus before committing to DROP.
+        # Solution: weight_drop = prob_dup * (1 - NIS)
+        #
+        # This product is HIGH only when BOTH conditions hold simultaneously:
+        #   - prob_dup is high   (cross-encoder thinks it's a duplicate)
+        #   - NIS is low         (attention confirms B is explained by A)
+        #
+        # For TopicBased false positives:
+        #   prob_dup ≈ 0.87, NIS ≈ 0.93 → weight = 0.87 * 0.07 = 0.06 → KEEP
+        # For true duplicates:
+        #   prob_dup ≈ 0.99, NIS ≈ 0.05 → weight = 0.99 * 0.95 = 0.94 → DROP
+        #
+        # Decision: mean(weight_drop) across K candidates vs WEIGHT_THRESHOLD.
+        # Fast-path guards still apply for unambiguous cases.
 
-        import math
-        chunk_len  = len(chunk["text"])
-        majority   = math.ceil(len(valid_scored) / 2)
-        votes_drop = 0
-        votes_keep = 0
-        decision   = None
-        reason     = ""
-        best       = None   # candidate that cast the deciding vote
+        chunk_len      = len(chunk["text"])
+        weight_scores  = []
+        best           = None
+        best_weight    = -1.0
+        decision       = None
+        reason         = ""
 
         for cand in valid_scored:
             prob = cand["prob_duplicate"]
             nis  = cand["nis_b_given_a"]
 
-            # Same 3-zone + length-aware guard logic as before, applied per candidate
-            if prob >= PROB_HIGH:
-                if chunk_len > LENGTH_GUARD and nis > NIS_FLOOR:
-                    vote        = "keep"
-                    vote_reason = f"length_guard ({chunk_len}chars > {LENGTH_GUARD}, nis={nis:.3f})"
-                else:
-                    vote        = "drop"
-                    vote_reason = f"prob_high ({prob:.3f} >= {PROB_HIGH})"
-            elif prob <= PROB_LOW:
-                vote        = "keep"
-                vote_reason = f"prob_low ({prob:.3f} <= {PROB_LOW})"
-            else:
-                if nis < NIS_DROP_THRESHOLD:
-                    if chunk_len > LENGTH_GUARD:
-                        vote        = "keep"
-                        vote_reason = f"length_guard_uncertainty ({chunk_len}chars, nis={nis:.3f})"
-                    else:
-                        vote        = "drop"
-                        vote_reason = f"nis_low ({nis:.3f} < {NIS_DROP_THRESHOLD}, prob={prob:.3f})"
-                else:
-                    vote        = "keep"
-                    vote_reason = f"nis_high ({nis:.3f} >= {NIS_DROP_THRESHOLD}, prob={prob:.3f})"
-
-            if vote == "drop":
-                votes_drop += 1
-            else:
-                votes_keep += 1
-
-            # Early exit: first side to reach majority wins
-            if votes_drop >= majority:
-                decision = "drop"
-                reason   = f"voting_drop ({votes_drop}/{len(valid_scored)} >= {majority}) | deciding: {vote_reason}"
-                best     = cand
-                break
-            if votes_keep >= majority:
+            # Fast-path 1: model very confident NOT a duplicate → KEEP immediately
+            if prob <= PROB_LOW:
                 decision = "keep"
-                reason   = f"voting_keep ({votes_keep}/{len(valid_scored)} >= {majority}) | deciding: {vote_reason}"
+                reason   = f"fast_keep_prob_low ({prob:.3f} <= {PROB_LOW})"
                 best     = cand
                 break
 
-        # Fallback: no majority reached (e.g. only 1 candidate after guard filtering)
-        # => default KEEP to avoid silent data loss
+            # Fast-path 2: unambiguous true duplicate (high prob, very low NIS)
+            # → DROP immediately, no need to average across candidates
+            if prob >= PROB_HIGH and nis < NIS_FLOOR:
+                # Length guard still applies
+                if chunk_len > LENGTH_GUARD:
+                    decision = "keep"
+                    reason   = f"length_guard ({chunk_len}chars > {LENGTH_GUARD})"
+                    best     = cand
+                    break
+                else:
+                    decision = "drop"
+                    reason   = f"fast_drop (prob={prob:.3f} >= {PROB_HIGH}, nis={nis:.3f} < {NIS_FLOOR})"
+                    best     = cand
+                    break
+
+            # General case: accumulate weighted score
+            w = prob * (1.0 - nis)
+            weight_scores.append(w)
+            if w > best_weight:
+                best_weight = w
+                best        = cand
+
+        # If fast-path did not decide, use mean weighted score
         if decision is None:
-            decision = "keep"
-            reason   = f"voting_no_majority (drop={votes_drop}, keep={votes_keep}) => default keep"
-            best     = valid_scored[-1]
+            if not weight_scores:
+                decision = "keep"
+                reason   = "no_weight_scores => default keep"
+                best     = valid_scored[-1] if valid_scored else {}
+            else:
+                score_drop = sum(weight_scores) / len(weight_scores)
+                if score_drop >= WEIGHT_THRESHOLD:
+                    decision = "drop"
+                    reason   = f"weighted_drop (score={score_drop:.4f} >= {WEIGHT_THRESHOLD}, n={len(weight_scores)})"
+                else:
+                    decision = "keep"
+                    reason   = f"weighted_keep (score={score_drop:.4f} < {WEIGHT_THRESHOLD}, n={len(weight_scores)})"
 
         # Heatmap saving is disabled to reduce ingest time.
         # Uncomment for visual analysis:
