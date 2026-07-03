@@ -221,7 +221,7 @@ def _sentence_level_merge(
 
     # Step 6 — min length guard
     if len(novel_text) < MIN_NOVEL_CHARS:
-        logger.debug(
+        logger.info(
             "  Merge skipped: novel_text too short (%d chars < %d)",
             len(novel_text), MIN_NOVEL_CHARS,
         )
@@ -248,7 +248,7 @@ def _sentence_level_merge(
     # Re-embed B_merged
     B_merged_vec = embed_fn([B_merged["text"]])[0]
 
-    logger.debug(
+    logger.info(
         "  Merge: appended %d novel sentence(s) (%d chars) to candidate '%s'",
         len(novel_sentences), len(novel_text), best_target_id,
     )
@@ -456,6 +456,10 @@ def run_cacd_dedup(
         else:
             # decision == "drop" — attempt sentence-level merge before discarding
             if embed_fn is not None:
+                logger.info(
+                    "  Attempting merge for dropped chunk '%s' (best_p=%.3f)",
+                    chunk["chunk_id"], best["prob_duplicate"],
+                )
                 B_merged, target_cand, B_merged_vec = _sentence_level_merge(
                     chunk["text"], valid_scored, embed_fn,
                 )
@@ -465,9 +469,14 @@ def run_cacd_dedup(
                     audit_log[-1]["decision"]      = "merge"
                     audit_log[-1]["reason"]        += f" | merged into '{target_cand['chunk_id']}'"
                     audit_log[-1]["merged_into"]   = target_cand["chunk_id"]
-                    logger.debug(
-                        "  MERGE: chunk '%s' merged into '%s'",
+                    logger.info(
+                        "  MERGE done: chunk '%s' merged into '%s'",
                         chunk["chunk_id"], target_cand["chunk_id"],
+                    )
+                else:
+                    logger.info(
+                        "  MERGE skipped: no novel content found in chunk '%s' => pure drop",
+                        chunk["chunk_id"],
                     )
 
         if (i + 1) % 50 == 0:
