@@ -51,7 +51,7 @@ TEXT_EMBED_DIM   = 384
 EMBED_BATCH_SIZE = 512 if torch.cuda.is_available() else 128
 
 # ── CACD — Stage 1 (Coarse retrieval) ────────────────────────────────────────
-CACD_TOP_K_CANDIDATES = 7   # top-K nearest neighbours retrieved from HNSW per chunk
+CACD_TOP_K_CANDIDATES = 5   # top-K nearest neighbours retrieved from HNSW per chunk
 
 # ── CACD — Stage 2 (Cross-attention) ─────────────────────────────────────────
 # Pretrained, no fine-tuning. Selected after a 37-model comparison experiment;
@@ -161,3 +161,15 @@ def _make_configs() -> list[dict]:
 
 
 CHUNKING_CONFIGS = _make_configs()
+
+# ── Sentence-level merge constants ────────────────────────────────────────────
+#
+# NIS_SENTENCE_NOVEL: min NIS for a sentence in A to be considered novel.
+#   Uses MIN rule across K candidates: sᵢ must be novel relative to ALL Bⱼ.
+#   Value 0.7 sits between partial overlap (~0.6) and fully novel (~0.9).
+NIS_SENTENCE_NOVEL = 0.7
+
+# MIN_NOVEL_CHARS: minimum character length for the merged novel text to be
+#   worth indexing. Below this the novel content is too short to produce a
+#   meaningful embedding and is discarded instead of being merged.
+MIN_NOVEL_CHARS = 50

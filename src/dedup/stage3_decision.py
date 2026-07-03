@@ -35,6 +35,8 @@ from configs.settings import (
     CACD_COST_FALSE_NEGATIVE,
     CACD_COST_FALSE_POSITIVE,
     HEATMAP_DIR,
+    NIS_SENTENCE_NOVEL,
+    MIN_NOVEL_CHARS,
 )
 from src.dedup.calibration import bayes_optimal_cutoff
 from src.dedup.stage1_coarse_retrieval import batch_coarse_retrieve
@@ -68,24 +70,6 @@ NIS_DROP_THRESHOLD = 0.8
 # Do not drop a chunk longer than LENGTH_GUARD characters unless NIS < NIS_FLOOR.
 LENGTH_GUARD = 300   # characters
 NIS_FLOOR    = 0.3   # absolute floor: NIS < NIS_FLOOR => drop even if chunk is long
-
-# Weighted-score threshold for Stage 3 decision.
-#
-# weight_drop = prob_dup * (1 - NIS)
-#
-# This product captures the JOINT signal: high only when the cross-encoder
-# is confident it is a duplicate (prob_dup high) AND attention confirms the
-# candidate explains the new chunk (NIS low). Topic-similar but content-
-# different chunks (e.g. TopicBased strategy) have high prob_dup but also
-# high NIS, yielding a low weight_drop — correctly surviving the filter.
-#
-# Threshold 0.3 derived from empirical case analysis:
-#   True duplicate:           weight ≈ 0.80–0.95 → DROP
-#   Paraphrase duplicate:     weight ≈ 0.70–0.80 → DROP
-#   Partial overlap 70%:      weight ≈ 0.47      → DROP
-#   Partial overlap 50%:      weight ≈ 0.26      → KEEP
-#   TopicBased false positive: weight ≈ 0.06     → KEEP
-WEIGHT_THRESHOLD = 0.3
 
 
 def save_heatmap(
@@ -160,36 +144,140 @@ def save_heatmap(
     return str(out_path)
 
 
+def _sentence_level_merge(
+    chunk_text: str,
+    valid_scored: list[dict],
+    embed_fn,
+) -> tuple[str | None, dict | None, list[float] | None]:
+    """
+    Sentence-level merge: when chunk A is voted DROP, extract novel sentences
+    from A and merge them into the best matching candidate already in the index.
+
+    Algorithm:
+      1. Split A into sentences.
+      2. For each sentence sᵢ, score against ALL K candidates using CrossEncoder.
+         sᵢ is novel if min(NIS(sᵢ | Bⱼ)) > NIS_SENTENCE_NOVEL across all j.
+         Uses MIN rule: sᵢ must be novel relative to every candidate.
+      3. For each novel sentence, identify the merge target:
+         target(sᵢ) = argmin_j NIS(sᵢ | Bⱼ) — the candidate that explains sᵢ
+         least (i.e. closest in content, most appropriate to receive the merge).
+      4. Group novel sentences by merge target.
+      5. For the target with the most novel sentences, construct B_merged:
+         B_merged_text = B_text + " " + " ".join(novel_sentences_for_this_target)
+      6. If len(B_merged_novel_part) >= MIN_NOVEL_CHARS: return B_merged.
+         Otherwise: return None (novel content too short to be worth indexing).
+
+    Args:
+        chunk_text   : text of new chunk A being considered for DROP.
+        valid_scored : list of scored candidate dicts from Stage 2
+                       (already filtered for parent-child pairs).
+        embed_fn     : callable(list[str]) => list[list[float]]
+                       used to re-embed B_merged after merge.
+
+    Returns:
+        (B_merged_chunk, B_merged_vec, target_B)  if merge is worthwhile
+        (None, None, None)                         if no novel content found
+    """
+    import re
+    from src.dedup.stage2_cross_attention import score_pair as _score_pair
+
+    # Step 1 — split A into sentences
+    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', chunk_text.strip()) if s.strip()]
+    if not sentences:
+        return None, None, None
+
+    # Step 2 & 3 — per sentence, compute NIS against all K candidates
+    # novel(sᵢ) = True if min_j NIS(sᵢ | Bⱼ) > NIS_SENTENCE_NOVEL
+    # target(sᵢ) = argmin_j NIS(sᵢ | Bⱼ)
+    #
+    # Note on direction: CrossEncoder(Bⱼ, sᵢ) sets Bⱼ as A and sᵢ as B,
+    # so NIS measures "how much of sᵢ is novel relative to Bⱼ" — correct direction.
+
+    novel_sentences_by_target: dict[str, list[str]] = {}  # {candidate_chunk_id: [sentences]}
+
+    for sent in sentences:
+        nis_scores = []
+        for cand in valid_scored:
+            # score_pair(text_a=Bⱼ, text_b=sᵢ): Bⱼ is the "known" context (A in NIS),
+            # sᵢ is the "new" text (B in NIS) — gives NIS(sᵢ | Bⱼ)
+            result = _score_pair(cand["text"], sent)
+            nis_scores.append((cand, result["nis_b_given_a"]))
+
+        min_nis_cand, min_nis_val = min(nis_scores, key=lambda x: x[1])
+
+        if min_nis_val > NIS_SENTENCE_NOVEL:
+            # Sentence is novel relative to ALL candidates (min > threshold)
+            target_id = min_nis_cand["chunk_id"]
+            novel_sentences_by_target.setdefault(target_id, [])
+            novel_sentences_by_target[target_id].append(sent)
+
+    if not novel_sentences_by_target:
+        return None, None, None
+
+    # Step 4 & 5 — pick target with most novel sentences, construct B_merged
+    best_target_id = max(novel_sentences_by_target, key=lambda k: len(novel_sentences_by_target[k]))
+    novel_sentences = novel_sentences_by_target[best_target_id]
+    novel_text = " ".join(novel_sentences)
+
+    # Step 6 — min length guard
+    if len(novel_text) < MIN_NOVEL_CHARS:
+        logger.debug(
+            "  Merge skipped: novel_text too short (%d chars < %d)",
+            len(novel_text), MIN_NOVEL_CHARS,
+        )
+        return None, None, None
+
+    # Find the target candidate dict
+    target_cand = next(c for c in valid_scored if c["chunk_id"] == best_target_id)
+
+    # Construct B_merged — keeps chunk_id of B so upsert overwrites B in Qdrant
+    B_merged = {
+        **target_cand,
+        "text": target_cand["text"] + " " + novel_text,
+    }
+
+    # Re-embed B_merged
+    B_merged_vec = embed_fn([B_merged["text"]])[0]
+
+    logger.debug(
+        "  Merge: appended %d novel sentence(s) (%d chars) to candidate '%s'",
+        len(novel_sentences), len(novel_text), best_target_id,
+    )
+    return B_merged, target_cand, B_merged_vec
+
+
 def run_cacd_dedup(
     chunks: list[dict],
     dense_vecs: list[list[float]],
     cname: str,
     config_name: str,
+    embed_fn=None,
     save_heatmaps: bool = True,
     max_heatmaps: int = 30,
 ) -> tuple[list[dict], list[dict]]:
     """
-    Run the full CACD pipeline (Stage 1 => 2 => 3) for one batch of chunks
-    being ingested into collection `cname`.
+    Run the full CACD pipeline (Stage 1 => 2 => 3 + Merge) for one batch
+    of chunks being ingested into collection `cname`.
 
     Chunks are processed sequentially: for each chunk, Stage 1 retrieves
-    candidates from the current index, Stage 2 scores them, Stage 3 decides
-    drop or keep, and kept chunks are inserted immediately so subsequent
-    chunks in the same document can be detected as duplicates of them.
+    candidates from the current index, Stage 2 scores them, Stage 3 votes
+    drop or keep. When DROP is decided, sentence-level merge is attempted:
+    novel sentences from the dropped chunk are appended to the most relevant
+    candidate and upserted back into Qdrant (overwriting the old version).
 
-    Input:
-        chunks      : list of chunk dicts with embeddings pre-computed.
-        dense_vecs  : embedding vector for each chunk (same order).
-        cname       : Qdrant collection name (empty at the start of ingest).
-        config_name : benchmark config label (used for heatmap paths and logs).
-        save_heatmaps: whether to save attention heatmaps (disabled by default
-                       to reduce ingest time).
-        max_heatmaps : maximum number of heatmaps to save per config.
+    Args:
+        chunks       : list of chunk dicts with embeddings pre-computed.
+        dense_vecs   : embedding vector for each chunk (same order).
+        cname        : Qdrant collection name (empty at start of ingest).
+        config_name  : benchmark config label (for heatmap paths and logs).
+        embed_fn     : callable(list[str]) => list[list[float]].
+                       Required for sentence-level merge to re-embed B_merged.
+                       If None, merge is skipped and DROP behaves as before.
+        save_heatmaps: whether to save attention heatmaps.
+        max_heatmaps : maximum heatmaps per config.
 
     Returns:
         (kept_chunks, audit_log)
-        kept_chunks : chunks that were kept (inserted into Qdrant).
-        audit_log   : list of dicts recording the decision for each chunk.
     """
     from src.ingestion.vector_store import upsert_chunks
 
@@ -257,81 +345,77 @@ def run_cacd_dedup(
             })
             continue
 
-        # Stage 3 — Weighted-score decision across K candidates.
+        # Stage 3 — Early-exit majority voting across K candidates.
         #
-        # Problem with binary voting: both prob_dup AND NIS are high for
-        # TopicBased false positives (same topic, different facts). Binary
-        # voting treats a high prob_dup as a DROP vote regardless of NIS,
-        # causing false drops on topic-similar but content-different chunks.
+        # Each valid candidate votes independently DROP or KEEP using the
+        # same 3-zone decision rule + length-aware guard as before.
+        # Voting stops as soon as one side reaches ceil(K/2) votes.
         #
-        # Solution: weight_drop = prob_dup * (1 - NIS)
-        #
-        # This product is HIGH only when BOTH conditions hold simultaneously:
-        #   - prob_dup is high   (cross-encoder thinks it's a duplicate)
-        #   - NIS is low         (attention confirms B is explained by A)
-        #
-        # For TopicBased false positives:
-        #   prob_dup ≈ 0.87, NIS ≈ 0.93 → weight = 0.87 * 0.07 = 0.06 → KEEP
-        # For true duplicates:
-        #   prob_dup ≈ 0.99, NIS ≈ 0.05 → weight = 0.99 * 0.95 = 0.94 → DROP
-        #
-        # Decision: mean(weight_drop) across K candidates vs WEIGHT_THRESHOLD.
-        # Fast-path guards still apply for unambiguous cases.
+        # Rationale: the original design dropped a chunk whenever the single
+        # highest-scoring candidate triggered DROP, even if K-1 other
+        # candidates all voted KEEP. A single Stage 1 retrieval artifact
+        # (a false positive from HNSW) could therefore cause a false drop.
+        # Majority voting requires genuine consensus before committing to DROP.
 
-        chunk_len      = len(chunk["text"])
-        weight_scores  = []
-        best           = None
-        best_weight    = -1.0
-        decision       = None
-        reason         = ""
+        import math
+        chunk_len  = len(chunk["text"])
+        majority   = math.ceil(len(valid_scored) / 2)
+        votes_drop = 0
+        votes_keep = 0
+        decision   = None
+        reason     = ""
+        best       = None   # candidate that cast the deciding vote
 
         for cand in valid_scored:
             prob = cand["prob_duplicate"]
             nis  = cand["nis_b_given_a"]
 
-            # Fast-path 1: model very confident NOT a duplicate → KEEP immediately
-            if prob <= PROB_LOW:
+            # Same 3-zone + length-aware guard logic as before, applied per candidate
+            if prob >= PROB_HIGH:
+                if chunk_len > LENGTH_GUARD and nis > NIS_FLOOR:
+                    vote        = "keep"
+                    vote_reason = f"length_guard ({chunk_len}chars > {LENGTH_GUARD}, nis={nis:.3f})"
+                else:
+                    vote        = "drop"
+                    vote_reason = f"prob_high ({prob:.3f} >= {PROB_HIGH})"
+            elif prob <= PROB_LOW:
+                vote        = "keep"
+                vote_reason = f"prob_low ({prob:.3f} <= {PROB_LOW})"
+            else:
+                if nis < NIS_DROP_THRESHOLD:
+                    if chunk_len > LENGTH_GUARD:
+                        vote        = "keep"
+                        vote_reason = f"length_guard_uncertainty ({chunk_len}chars, nis={nis:.3f})"
+                    else:
+                        vote        = "drop"
+                        vote_reason = f"nis_low ({nis:.3f} < {NIS_DROP_THRESHOLD}, prob={prob:.3f})"
+                else:
+                    vote        = "keep"
+                    vote_reason = f"nis_high ({nis:.3f} >= {NIS_DROP_THRESHOLD}, prob={prob:.3f})"
+
+            if vote == "drop":
+                votes_drop += 1
+            else:
+                votes_keep += 1
+
+            # Early exit: first side to reach majority wins
+            if votes_drop >= majority:
+                decision = "drop"
+                reason   = f"voting_drop ({votes_drop}/{len(valid_scored)} >= {majority}) | deciding: {vote_reason}"
+                best     = cand
+                break
+            if votes_keep >= majority:
                 decision = "keep"
-                reason   = f"fast_keep_prob_low ({prob:.3f} <= {PROB_LOW})"
+                reason   = f"voting_keep ({votes_keep}/{len(valid_scored)} >= {majority}) | deciding: {vote_reason}"
                 best     = cand
                 break
 
-            # Fast-path 2: unambiguous true duplicate (high prob, very low NIS)
-            # → DROP immediately, no need to average across candidates
-            if prob >= PROB_HIGH and nis < NIS_FLOOR:
-                # Length guard still applies
-                if chunk_len > LENGTH_GUARD:
-                    decision = "keep"
-                    reason   = f"length_guard ({chunk_len}chars > {LENGTH_GUARD})"
-                    best     = cand
-                    break
-                else:
-                    decision = "drop"
-                    reason   = f"fast_drop (prob={prob:.3f} >= {PROB_HIGH}, nis={nis:.3f} < {NIS_FLOOR})"
-                    best     = cand
-                    break
-
-            # General case: accumulate weighted score
-            w = prob * (1.0 - nis)
-            weight_scores.append(w)
-            if w > best_weight:
-                best_weight = w
-                best        = cand
-
-        # If fast-path did not decide, use mean weighted score
+        # Fallback: no majority reached (e.g. only 1 candidate after guard filtering)
+        # => default KEEP to avoid silent data loss
         if decision is None:
-            if not weight_scores:
-                decision = "keep"
-                reason   = "no_weight_scores => default keep"
-                best     = valid_scored[-1] if valid_scored else {}
-            else:
-                score_drop = sum(weight_scores) / len(weight_scores)
-                if score_drop >= WEIGHT_THRESHOLD:
-                    decision = "drop"
-                    reason   = f"weighted_drop (score={score_drop:.4f} >= {WEIGHT_THRESHOLD}, n={len(weight_scores)})"
-                else:
-                    decision = "keep"
-                    reason   = f"weighted_keep (score={score_drop:.4f} < {WEIGHT_THRESHOLD}, n={len(weight_scores)})"
+            decision = "keep"
+            reason   = f"voting_no_majority (drop={votes_drop}, keep={votes_keep}) => default keep"
+            best     = valid_scored[-1]
 
         # Heatmap saving is disabled to reduce ingest time.
         # Uncomment for visual analysis:
@@ -360,6 +444,22 @@ def run_cacd_dedup(
         if decision == "keep":
             kept_chunks.append(chunk)
             upsert_chunks(cname, [chunk], [vec])
+        else:
+            # decision == "drop" — attempt sentence-level merge before discarding
+            if embed_fn is not None:
+                B_merged, target_cand, B_merged_vec = _sentence_level_merge(
+                    chunk["text"], valid_scored, embed_fn,
+                )
+                if B_merged is not None:
+                    # Upsert B_merged — same chunk_id as B => overwrites B in Qdrant
+                    upsert_chunks(cname, [B_merged], [B_merged_vec])
+                    audit_log[-1]["decision"]      = "merge"
+                    audit_log[-1]["reason"]        += f" | merged into '{target_cand['chunk_id']}'"
+                    audit_log[-1]["merged_into"]   = target_cand["chunk_id"]
+                    logger.debug(
+                        "  MERGE: chunk '%s' merged into '%s'",
+                        chunk["chunk_id"], target_cand["chunk_id"],
+                    )
 
         if (i + 1) % 50 == 0:
             n_dropped = (i + 1) - len(kept_chunks)

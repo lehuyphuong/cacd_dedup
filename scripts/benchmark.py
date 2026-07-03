@@ -136,9 +136,11 @@ def run_ingest_cacd(
     cname = collection_name(strategy, chunk_size, overlap, "cacd")
     ensure_collection(cname, recreate=True)
 
-    # Step 4: Run CACD (Stage 1 => 2 => 3, DROP branch only)
+    # Step 4: Run CACD (Stage 1 => 2 => 3 + Merge)
+    # embed_fn is passed so that sentence-level merge can re-embed B_merged.
     kept_chunks, audit_log = run_cacd_dedup(
         embedded_chunks, dense_vecs, cname, config_name,
+        embed_fn=embed_fn,
         save_heatmaps=True,
     )
 
