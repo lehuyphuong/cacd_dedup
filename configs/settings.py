@@ -51,7 +51,7 @@ TEXT_EMBED_DIM   = 384
 EMBED_BATCH_SIZE = 512 if torch.cuda.is_available() else 128
 
 # ── CACD — Stage 1 (Coarse retrieval) ────────────────────────────────────────
-CACD_TOP_K_CANDIDATES = 5   # top-K nearest neighbours retrieved from HNSW per chunk
+CACD_TOP_K_CANDIDATES = 7   # top-K nearest neighbours retrieved from HNSW per chunk
 
 # ── CACD — Stage 2 (Cross-attention) ─────────────────────────────────────────
 # Pretrained, no fine-tuning. Selected after a 37-model comparison experiment;
