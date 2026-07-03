@@ -230,10 +230,19 @@ def _sentence_level_merge(
     # Find the target candidate dict
     target_cand = next(c for c in valid_scored if c["chunk_id"] == best_target_id)
 
-    # Construct B_merged — keeps chunk_id of B so upsert overwrites B in Qdrant
+    # Construct B_merged — keeps chunk_id of B so upsert overwrites B in Qdrant.
+    # target_cand comes from Stage 1 payload and may not have char_start/char_end
+    # (those fields are optional in the payload). Provide safe defaults so that
+    # upsert_chunks does not raise KeyError.
     B_merged = {
-        **target_cand,
-        "text": target_cand["text"] + " " + novel_text,
+        "chunk_id":   target_cand["chunk_id"],
+        "doc_id":     target_cand["doc_id"],
+        "title":      target_cand.get("title", ""),
+        "text":       target_cand["text"] + " " + novel_text,
+        "char_start": target_cand.get("char_start", 0),
+        "char_end":   target_cand.get("char_end", 0),
+        "parent_id":  target_cand.get("parent_id"),
+        "level":      target_cand.get("level"),
     }
 
     # Re-embed B_merged
