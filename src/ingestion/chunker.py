@@ -545,6 +545,7 @@ def semantic_chunker(
     doc: dict,
     threshold_percentile: float = 95.0,
     embed_fn: Callable | None = None,
+    chunk_size: int | None = None,
 ) -> list[dict]:
     """
     SemanticChunker / ClusterSemantic (v3) — sequential breakpoint detection.
@@ -562,14 +563,28 @@ def semantic_chunker(
                                breakpoint threshold (e.g. 95.0 => top 5% of
                                distances become boundaries).
         embed_fn             : callable(list[str]) => list[list[float]].
+        chunk_size           : target chunk length in characters. Semantic
+                               breakpoints alone do not respect any target
+                               size — this is only a *soft* constraint applied
+                               as a post-processing pass (Step 3 below), so
+                               semantically coherent boundaries are still
+                               preferred over hard cuts wherever possible.
+
+    BUGFIX (previously): chunk_size was accepted upstream (get_chunker /
+    settings.py CHUNKING_CONFIGS) but silently ignored here — the two
+    configured sizes (200, 400) produced byte-identical output because only
+    threshold_percentile (identical for both) drove the segmentation. This
+    made one of the 18 benchmark configs a duplicate of another. Fixed by
+    using chunk_size to merge undersized segments and split oversized ones
+    after the semantic breakpoints are computed.
     """
     if embed_fn is None:
         logger.debug("SemanticChunker: no embed_fn, falling back to RecursiveChunker")
-        return recursive_chunker(doc, chunk_size=500, overlap=0)
+        return recursive_chunker(doc, chunk_size=chunk_size or 500, overlap=0)
 
     sentences = _sentence_split(doc["text"])
     if len(sentences) < 3:
-        return recursive_chunker(doc, chunk_size=500, overlap=0)
+        return recursive_chunker(doc, chunk_size=chunk_size or 500, overlap=0)
 
     vecs  = np.array(embed_fn(sentences), dtype=np.float32)
     norms = np.linalg.norm(vecs, axis=1, keepdims=True)
@@ -584,37 +599,89 @@ def semantic_chunker(
 
     threshold = float(np.percentile(distances, threshold_percentile))
 
-    text    = doc["text"]
-    chunks  = []
-    buf     = [sentences[0]]
-    chunk_i = 0
-    cursor  = 0
-
+    # Step 1 — group sentences into segments at semantic breakpoints.
+    segments: list[list[str]] = []
+    buf = [sentences[0]]
     for i, dist in enumerate(distances):
         if dist >= threshold:
-            chunk_text = " ".join(buf).strip()
-            if chunk_text:
-                start = _find_offset(text, buf[0], cursor)
-                end   = start + len(chunk_text)
-                chunks.append(_make_chunk(
-                    doc, f"{doc['doc_id']}_{chunk_i}", chunk_text, start, end,
-                ))
-                cursor   = end
-                chunk_i += 1
+            segments.append(buf)
             buf = [sentences[i + 1]]
         else:
             buf.append(sentences[i + 1])
+    segments.append(buf)
 
-    if buf:
-        chunk_text = " ".join(buf).strip()
-        if chunk_text:
-            start = _find_offset(text, buf[0], cursor)
-            end   = start + len(chunk_text)
+    # Step 2 — apply chunk_size as a soft target (merge undersized segments,
+    # split oversized ones). Without this, threshold_percentile alone decides
+    # the output and chunk_size has no effect at all.
+    target = chunk_size or 500
+    min_len = target // 2
+    max_len = int(target * 1.5)
+
+    merged_segments: list[list[str]] = []
+    running: list[str] = []
+    for seg in segments:
+        running.extend(seg)
+        running_len = sum(len(s) for s in running) + len(running) - 1
+        if running_len >= min_len:
+            merged_segments.append(running)
+            running = []
+    if running:
+        if merged_segments:
+            merged_segments[-1].extend(running)
+        else:
+            merged_segments.append(running)
+
+    # Step 3 — build chunks, splitting any segment still longer than max_len
+    # at sentence boundaries (keeps semantic grouping where it fits, falls
+    # back to a size-bounded split only where a single semantic segment is
+    # much larger than the target).
+    text    = doc["text"]
+    chunks  = []
+    chunk_i = 0
+    cursor  = 0
+
+    for seg in merged_segments:
+        seg_text = " ".join(seg).strip()
+        if not seg_text:
+            continue
+        if len(seg_text) <= max_len:
+            start = _find_offset(text, seg[0], cursor)
+            end   = start + len(seg_text)
             chunks.append(_make_chunk(
-                doc, f"{doc['doc_id']}_{chunk_i}", chunk_text, start, end,
+                doc, f"{doc['doc_id']}_{chunk_i}", seg_text, start, end,
             ))
+            cursor   = end
+            chunk_i += 1
+            continue
 
-    return chunks if chunks else recursive_chunker(doc, chunk_size=500, overlap=0)
+        # Oversized segment: sub-split at sentence boundaries, packing up to
+        # `target` chars per piece — a size-bounded split, but still never
+        # cutting inside a sentence.
+        piece: list[str] = []
+        for sent in seg:
+            piece.append(sent)
+            piece_len = sum(len(s) for s in piece) + len(piece) - 1
+            if piece_len >= target:
+                piece_text = " ".join(piece).strip()
+                start = _find_offset(text, piece[0], cursor)
+                end   = start + len(piece_text)
+                chunks.append(_make_chunk(
+                    doc, f"{doc['doc_id']}_{chunk_i}", piece_text, start, end,
+                ))
+                cursor   = end
+                chunk_i += 1
+                piece    = []
+        if piece:
+            piece_text = " ".join(piece).strip()
+            start = _find_offset(text, piece[0], cursor)
+            end   = start + len(piece_text)
+            chunks.append(_make_chunk(
+                doc, f"{doc['doc_id']}_{chunk_i}", piece_text, start, end,
+            ))
+            cursor   = end
+            chunk_i += 1
+
+    return chunks if chunks else recursive_chunker(doc, chunk_size=target, overlap=0)
 
 
 def overlapping_chunker(
@@ -693,6 +760,7 @@ def get_chunker(
             doc,
             threshold_percentile=extra.get("threshold_percentile", 95.0),
             embed_fn=_fn,
+            chunk_size=chunk_size,
         )
     elif strategy == "Overlapping":
         return lambda doc: overlapping_chunker(

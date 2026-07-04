@@ -142,6 +142,7 @@ def run_ingest_cacd(
         embedded_chunks, dense_vecs, cname, config_name,
         embed_fn=embed_fn,
         save_heatmaps=True,
+        chunk_size=chunk_size,
     )
 
     ingest_time = time.perf_counter() - t0

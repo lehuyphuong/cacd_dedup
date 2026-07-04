@@ -162,8 +162,38 @@ def _make_configs() -> list[dict]:
 
 CHUNKING_CONFIGS = _make_configs()
 
-# ── Sentence-level merge constants ────────────────────────────────────────────
+# ── Sentence-level merge safety guards ────────────────────────────────────────
 #
+# These three settings close the gap identified after analysing the full-dataset
+# Merge run (Recall highest, Precision lowest -> IoU lowest of all methods):
+#
+#   1. MERGE_SAME_DOC_ONLY: the persistent index intentionally spans the whole
+#      2,067-document corpus (dedup is meant to catch redundancy *across*
+#      documents, not just within one) — that scope is correct by design and
+#      is NOT changed here. What was missing is a same-document constraint
+#      specifically on the MERGE target: a novel sentence from document A must
+#      not be spliced into a chunk that will keep being served as document B's
+#      content. Restricting merge (not retrieval/dedup) to same-doc candidates
+#      prevents cross-document token contamination in Te/Tr token-overlap eval.
+#
+#   2. MERGE_MAX_SIZE_MULTIPLIER: caps how large a merged chunk may grow
+#      relative to its strategy's target chunk_size, so a single "hub" chunk
+#      cannot silently absorb an unbounded number of merges over the course
+#      of one ingest pass.
+#
+#   3. MERGE_MAX_EMBED_CHARS: a hard character ceiling approximating the
+#      embedding model's max_seq_length (all-MiniLM-L6-v2 ~= 256 tokens；
+#      ~4 chars/token in English, minus margin) so that whatever text is
+#      passed to embed_fn() after a merge is fully represented in the new
+#      vector rather than silently truncated by the tokenizer. Re-embedding
+#      after merge (already done in _sentence_level_merge) only fixes staleness
+#      if the text handed to it is short enough to be embedded in full — this
+#      cap is what actually guarantees that.
+MERGE_SAME_DOC_ONLY       = True
+MERGE_MAX_SIZE_MULTIPLIER = 2.0
+MERGE_MAX_EMBED_CHARS     = 900
+
+
 # NIS_SENTENCE_NOVEL: min NIS for a sentence in A to be considered novel.
 #   Uses MIN rule across K candidates: sᵢ must be novel relative to ALL Bⱼ.
 #   Value 0.7 sits between partial overlap (~0.6) and fully novel (~0.9).

@@ -37,6 +37,9 @@ from configs.settings import (
     HEATMAP_DIR,
     NIS_SENTENCE_NOVEL,
     MIN_NOVEL_CHARS,
+    MERGE_SAME_DOC_ONLY,
+    MERGE_MAX_SIZE_MULTIPLIER,
+    MERGE_MAX_EMBED_CHARS,
 )
 from src.dedup.calibration import bayes_optimal_cutoff
 from src.dedup.stage1_coarse_retrieval import batch_coarse_retrieve
@@ -146,6 +149,8 @@ def save_heatmap(
 
 def _sentence_level_merge(
     chunk_text: str,
+    chunk_doc_id: str,
+    chunk_size: int,
     valid_scored: list[dict],
     embed_fn,
 ) -> tuple[str | None, dict | None, list[float] | None]:
@@ -155,20 +160,50 @@ def _sentence_level_merge(
 
     Algorithm:
       1. Split A into sentences.
-      2. For each sentence sᵢ, score against ALL K candidates using CrossEncoder.
-         sᵢ is novel if min(NIS(sᵢ | Bⱼ)) > NIS_SENTENCE_NOVEL across all j.
+      2. Restrict candidates to the SAME document as A (Fix 1 — see below).
+      3. For each sentence sᵢ, score against the remaining candidates using
+         CrossEncoder. sᵢ is novel if min(NIS(sᵢ | Bⱼ)) > NIS_SENTENCE_NOVEL.
          Uses MIN rule: sᵢ must be novel relative to every candidate.
-      3. For each novel sentence, identify the merge target:
-         target(sᵢ) = argmin_j NIS(sᵢ | Bⱼ) — the candidate that explains sᵢ
-         least (i.e. closest in content, most appropriate to receive the merge).
-      4. Group novel sentences by merge target.
-      5. For the target with the most novel sentences, construct B_merged:
-         B_merged_text = B_text + " " + " ".join(novel_sentences_for_this_target)
-      6. If len(B_merged_novel_part) >= MIN_NOVEL_CHARS: return B_merged.
-         Otherwise: return None (novel content too short to be worth indexing).
+      4. For each novel sentence, identify the merge target:
+         target(sᵢ) = argmin_j NIS(sᵢ | Bⱼ) — the candidate with the lowest
+         novelty score, i.e. the closest topical match among the remaining
+         (same-document) candidates.
+      5. Group novel sentences by merge target.
+      6. For the target with the most novel sentences, append novel sentences
+         one at a time up to a hard size cap (Fix 2 + Fix 3 — see below).
+      7. If the resulting novel part is still >= MIN_NOVEL_CHARS: return
+         B_merged. Otherwise: return None (nothing worth indexing).
+
+    Fix 1 (MERGE_SAME_DOC_ONLY) — cross-document contamination:
+      The persistent index intentionally spans the whole corpus (dedup must
+      catch redundancy across documents, that scope stays unchanged). But
+      MERGE specifically must not splice a sentence from document A into a
+      chunk that keeps being served under document B's doc_id — otherwise
+      Precision/IoU are evaluated against Te (tokens of ONE reference
+      document) while Tr silently gains tokens from a different document.
+      Root-cause analysis on the full-dataset merge run (Recall highest,
+      Precision lowest, IoU lowest of all methods) traced back to this:
+      target selection never checked doc_id equality.
+
+    Fix 2 + 3 (MERGE_MAX_SIZE_MULTIPLIER / MERGE_MAX_EMBED_CHARS) — unbounded
+    growth + silent embedding truncation:
+      Previously there was only a MIN_NOVEL_CHARS floor and no ceiling, so a
+      single "hub" chunk_id could absorb an unbounded number of merges over
+      one ingest pass. Separately, embed_fn() truncates internally at the
+      embedding model's max_seq_length — re-embedding after merge (kept
+      below) only produces a vector that reflects the *whole* merged text if
+      that text is short enough to avoid truncation in the first place.
+      MERGE_MAX_EMBED_CHARS is a conservative character-based proxy for that
+      token limit; MERGE_MAX_SIZE_MULTIPLIER keeps merged chunks proportional
+      to the strategy's own target chunk_size. The effective cap is the
+      smaller of the two.
 
     Args:
         chunk_text   : text of new chunk A being considered for DROP.
+        chunk_doc_id : doc_id of A — used to restrict merge targets to the
+                       same document (Fix 1).
+        chunk_size   : configured target chunk size (chars) for the current
+                       chunking strategy — used to scale the size cap (Fix 2).
         valid_scored : list of scored candidate dicts from Stage 2
                        (already filtered for parent-child pairs).
         embed_fn     : callable(list[str]) => list[list[float]]
@@ -186,7 +221,23 @@ def _sentence_level_merge(
     if not sentences:
         return None, None, None
 
-    # Step 2 & 3 — per sentence, compute NIS against all K candidates
+    # Step 2 — Fix 1: restrict merge candidates to the same document as A.
+    # (Stage 1/2/3's DROP decision still uses the full cross-document index —
+    # only the MERGE target is constrained here.)
+    if MERGE_SAME_DOC_ONLY:
+        same_doc_candidates = [c for c in valid_scored if c.get("doc_id") == chunk_doc_id]
+    else:
+        same_doc_candidates = valid_scored
+
+    if not same_doc_candidates:
+        logger.info(
+            "  Merge skipped: no same-document candidate among %d valid candidate(s) "
+            "(doc_id=%s) => falling back to plain drop",
+            len(valid_scored), chunk_doc_id,
+        )
+        return None, None, None
+
+    # Step 3 & 4 — per sentence, compute NIS against the same-document candidates
     # novel(sᵢ) = True if min_j NIS(sᵢ | Bⱼ) > NIS_SENTENCE_NOVEL
     # target(sᵢ) = argmin_j NIS(sᵢ | Bⱼ)
     #
@@ -197,7 +248,7 @@ def _sentence_level_merge(
 
     for sent in sentences:
         nis_scores = []
-        for cand in valid_scored:
+        for cand in same_doc_candidates:
             # score_pair(text_a=Bⱼ, text_b=sᵢ): Bⱼ is the "known" context (A in NIS),
             # sᵢ is the "new" text (B in NIS) — gives NIS(sᵢ | Bⱼ)
             result = _score_pair(cand["text"], sent)
@@ -206,7 +257,7 @@ def _sentence_level_merge(
         min_nis_cand, min_nis_val = min(nis_scores, key=lambda x: x[1])
 
         if min_nis_val > NIS_SENTENCE_NOVEL:
-            # Sentence is novel relative to ALL candidates (min > threshold)
+            # Sentence is novel relative to ALL same-doc candidates (min > threshold)
             target_id = min_nis_cand["chunk_id"]
             novel_sentences_by_target.setdefault(target_id, [])
             novel_sentences_by_target[target_id].append(sent)
@@ -214,21 +265,51 @@ def _sentence_level_merge(
     if not novel_sentences_by_target:
         return None, None, None
 
-    # Step 4 & 5 — pick target with most novel sentences, construct B_merged
+    # Step 5 — pick target with most novel sentences
     best_target_id = max(novel_sentences_by_target, key=lambda k: len(novel_sentences_by_target[k]))
     novel_sentences = novel_sentences_by_target[best_target_id]
-    novel_text = " ".join(novel_sentences)
+    target_cand = next(c for c in same_doc_candidates if c["chunk_id"] == best_target_id)
 
-    # Step 6 — min length guard
+    # Step 6 — Fix 2 + 3: cap how much novel text can be appended.
+    # Effective cap = min(chunk_size * MERGE_MAX_SIZE_MULTIPLIER, MERGE_MAX_EMBED_CHARS),
+    # counted against the CURRENT length of the target's own text so repeated
+    # merges into the same target_cand over the ingest pass cannot exceed it.
+    size_cap = min(chunk_size * MERGE_MAX_SIZE_MULTIPLIER, MERGE_MAX_EMBED_CHARS)
+    budget   = max(0, int(size_cap) - len(target_cand["text"]) - 1)  # -1 for the joining space
+
+    accepted: list[str] = []
+    used = 0
+    for sent in novel_sentences:
+        add_len = len(sent) + (1 if accepted else 0)  # +1 for joining space
+        if used + add_len > budget:
+            break
+        accepted.append(sent)
+        used += add_len
+
+    if not accepted:
+        logger.info(
+            "  Merge skipped: target '%s' already at/near size cap (%d chars, cap=%d) "
+            "=> no room for novel content",
+            best_target_id, len(target_cand["text"]), int(size_cap),
+        )
+        return None, None, None
+
+    novel_text = " ".join(accepted)
+
+    if len(novel_sentences) > len(accepted):
+        logger.info(
+            "  Merge: size cap reached — kept %d/%d novel sentence(s) for target '%s' "
+            "(remaining sentence(s) fall back to plain drop, not merged elsewhere)",
+            len(accepted), len(novel_sentences), best_target_id,
+        )
+
+    # Step 7 — min length guard
     if len(novel_text) < MIN_NOVEL_CHARS:
         logger.info(
             "  Merge skipped: novel_text too short (%d chars < %d)",
             len(novel_text), MIN_NOVEL_CHARS,
         )
         return None, None, None
-
-    # Find the target candidate dict
-    target_cand = next(c for c in valid_scored if c["chunk_id"] == best_target_id)
 
     # Construct B_merged — keeps chunk_id of B so upsert overwrites B in Qdrant.
     # target_cand comes from Stage 1 payload and may not have char_start/char_end
@@ -245,14 +326,19 @@ def _sentence_level_merge(
         "level":      target_cand.get("level"),
     }
 
-    # Re-embed B_merged
+    # Re-embed B_merged. Because of the size cap above, B_merged["text"] is
+    # guaranteed to stay within MERGE_MAX_EMBED_CHARS, so this re-embedding
+    # is not silently truncated the way an unbounded merge would be.
     B_merged_vec = embed_fn([B_merged["text"]])[0]
 
     logger.info(
-        "  Merge: appended %d novel sentence(s) (%d chars) to candidate '%s'",
-        len(novel_sentences), len(novel_text), best_target_id,
+        "  Merge: appended %d novel sentence(s) (%d chars, same doc_id=%s) to candidate '%s' "
+        "(new total %d chars, cap=%d)",
+        len(accepted), len(novel_text), chunk_doc_id, best_target_id,
+        len(B_merged["text"]), int(size_cap),
     )
     return B_merged, target_cand, B_merged_vec
+
 
 
 def run_cacd_dedup(
@@ -263,6 +349,7 @@ def run_cacd_dedup(
     embed_fn=None,
     save_heatmaps: bool = True,
     max_heatmaps: int = 30,
+    chunk_size: int = 400,
 ) -> tuple[list[dict], list[dict]]:
     """
     Run the full CACD pipeline (Stage 1 => 2 => 3 + Merge) for one batch
@@ -272,7 +359,9 @@ def run_cacd_dedup(
     candidates from the current index, Stage 2 scores them, Stage 3 votes
     drop or keep. When DROP is decided, sentence-level merge is attempted:
     novel sentences from the dropped chunk are appended to the most relevant
-    candidate and upserted back into Qdrant (overwriting the old version).
+    SAME-DOCUMENT candidate (see MERGE_SAME_DOC_ONLY) and upserted back into
+    Qdrant (overwriting the old version), subject to a size cap
+    (MERGE_MAX_SIZE_MULTIPLIER / MERGE_MAX_EMBED_CHARS).
 
     Args:
         chunks       : list of chunk dicts with embeddings pre-computed.
@@ -284,6 +373,8 @@ def run_cacd_dedup(
                        If None, merge is skipped and DROP behaves as before.
         save_heatmaps: whether to save attention heatmaps.
         max_heatmaps : maximum heatmaps per config.
+        chunk_size   : configured target chunk size (chars) for the current
+                       chunking strategy — used to scale the merge size cap.
 
     Returns:
         (kept_chunks, audit_log)
@@ -461,7 +552,7 @@ def run_cacd_dedup(
                     chunk["chunk_id"], best["prob_duplicate"],
                 )
                 B_merged, target_cand, B_merged_vec = _sentence_level_merge(
-                    chunk["text"], valid_scored, embed_fn,
+                    chunk["text"], chunk["doc_id"], chunk_size, valid_scored, embed_fn,
                 )
                 if B_merged is not None:
                     # Upsert B_merged — same chunk_id as B => overwrites B in Qdrant
