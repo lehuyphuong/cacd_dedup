@@ -68,8 +68,8 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 #
 # Default is symmetric (cutoff = 0.5). Increase CACD_COST_FALSE_POSITIVE to
 # make the system more conservative when dropping (prefer recall over precision).
-CACD_COST_FALSE_POSITIVE = 1.0
-CACD_COST_FALSE_NEGATIVE = 1.0
+CACD_COST_FALSE_POSITIVE = 0.7
+CACD_COST_FALSE_NEGATIVE = 1.3
 
 # ── Vector store — Qdrant (embedded, no Docker) ───────────────────────────────
 COLLECTION_PREFIX = "cacd_dedup"
@@ -197,7 +197,7 @@ MERGE_MAX_EMBED_CHARS     = 900
 # NIS_SENTENCE_NOVEL: min NIS for a sentence in A to be considered novel.
 #   Uses MIN rule across K candidates: sᵢ must be novel relative to ALL Bⱼ.
 #   Value 0.7 sits between partial overlap (~0.6) and fully novel (~0.9).
-NIS_SENTENCE_NOVEL = 0.7
+NIS_SENTENCE_NOVEL = 0.55
 
 # MIN_NOVEL_CHARS: minimum character length for the merged novel text to be
 #   worth indexing. Below this the novel content is too short to produce a
