@@ -68,8 +68,8 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 #
 # Default is symmetric (cutoff = 0.5). Increase CACD_COST_FALSE_POSITIVE to
 # make the system more conservative when dropping (prefer recall over precision).
-CACD_COST_FALSE_POSITIVE = 0.7
-CACD_COST_FALSE_NEGATIVE = 1.3
+CACD_COST_FALSE_POSITIVE = 1.3
+CACD_COST_FALSE_NEGATIVE = 0.7
 
 # ── Vector store — Qdrant (embedded, no Docker) ───────────────────────────────
 COLLECTION_PREFIX = "cacd_dedup"
