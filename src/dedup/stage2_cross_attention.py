@@ -22,18 +22,32 @@ Public API:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 
 import numpy as np
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-from configs.settings import CACD_CROSS_ENCODER_MODEL, DEVICE
+from configs.settings import CACD_CROSS_ENCODER_MODEL, CACD_USE_FP16, DEVICE
 
 logger = logging.getLogger(__name__)
 
 _tokenizer = None
 _model     = None
+
+
+def _autocast_ctx():
+    """
+    Mixed-precision context for the cross-encoder forward pass.
+
+    Only enabled on CUDA: torch.autocast on CPU does not speed anything up
+    and can even be slower, so this is a deliberate no-op (nullcontext) for
+    CPU-only runs regardless of CACD_USE_FP16.
+    """
+    if CACD_USE_FP16 and DEVICE == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    return contextlib.nullcontext()
 
 
 def get_cross_encoder():
@@ -165,6 +179,7 @@ def _novel_information_score(
 
 
 @torch.no_grad()
+@torch.no_grad()
 def score_pair(text_a: str, text_b: str) -> dict:
     """
     Score the redundancy of one pair (text_a, text_b) via the cross-encoder.
@@ -191,7 +206,8 @@ def score_pair(text_a: str, text_b: str) -> dict:
         padding=True,
     ).to(DEVICE)
 
-    outputs = model(**inputs)
+    with _autocast_ctx():
+        outputs = model(**inputs)
 
     # Handle both binary models (scalar logit) and multi-class models (e.g. NLI 3-class)
     logits = outputs.logits.squeeze()
@@ -308,10 +324,9 @@ def score_candidates_batched(
         padding=True,   # pad to the same length within the batch
     ).to(DEVICE)
 
-    outputs = model(**inputs)
-
-    logits_batch    = outputs.logits          # (batch, num_labels)
-    attentions_last = outputs.attentions[-1]  # (batch, num_heads, seq, seq)
+    outputs = None
+    with _autocast_ctx():
+        outputs = model(**inputs)
 
     for batch_i, (orig_i, cand) in enumerate(to_score):
         logits = logits_batch[batch_i]
@@ -343,6 +358,89 @@ def score_candidates_batched(
             "coverage_b_to_a": round(cov_b2a, 4),
             "nis_b_given_a":   nis,
         }
+
+    return results
+
+
+@torch.no_grad()
+def score_sentences_batched(candidate_text: str, sentences: list[str]) -> list[dict]:
+    """
+    Batch version of the per-sentence scoring used by sentence-level merge —
+    tokenises one candidate against ALL of A's sentences together and runs a
+    single forward pass, instead of one forward pass per sentence.
+
+    This mirrors score_candidates_batched but with the roles reversed: there,
+    one new chunk is fixed as text_a and many candidates vary as text_b; here,
+    one candidate is fixed as text_a (playing the "known context" role for
+    NIS, exactly as in the single-pair call this replaces:
+    score_pair(candidate_text, sentence)) and A's sentences vary as text_b.
+    Looping over the (few, same-document) candidates and batching over
+    sentences inside each iteration turns m*k single-pair forward passes
+    into k batched ones, with identical outputs (same tokenisation, same
+    model, same math — only the batching changes).
+
+    Input:
+        candidate_text : text of one same-document candidate B_j (the "A"
+                          role for NIS purposes, matching score_pair's usage
+                          in the merge step: score_pair(cand["text"], sent)).
+        sentences      : list of A's sentences (the "B" role), scored all
+                          at once against candidate_text.
+
+    Returns:
+        list of dicts, one per sentence, in the same order as `sentences`,
+        each with the same fields as score_pair (raw_logit, prob_duplicate,
+        coverage_a_to_b, coverage_b_to_a, nis_b_given_a).
+    """
+    if not sentences:
+        return []
+
+    tokenizer, model = get_cross_encoder()
+
+    texts_a = [candidate_text] * len(sentences)
+    texts_b = list(sentences)
+
+    inputs = tokenizer(
+        texts_a, texts_b,
+        return_tensors="pt",
+        truncation=True,
+        max_length=256,
+        padding=True,
+    ).to(DEVICE)
+
+    with _autocast_ctx():
+        outputs = model(**inputs)
+
+    logits_batch    = outputs.logits          # (batch, num_labels)
+    attentions_last = outputs.attentions[-1]  # (batch, num_heads, seq, seq)
+
+    results = []
+    for batch_i in range(len(sentences)):
+        logits = logits_batch[batch_i]
+        if logits.dim() == 0 or logits.shape[0] == 1:
+            prob_dup  = float(torch.sigmoid(logits.squeeze()).item())
+            raw_logit = logits.squeeze().item()
+        else:
+            prob_dup  = float(torch.softmax(logits, dim=-1)[-1].item())
+            raw_logit = logits[-1].item()
+
+        avg_attn = attentions_last[batch_i].mean(dim=0)  # (seq, seq)
+
+        input_ids = inputs["input_ids"][batch_i]
+        n_tokens  = int(inputs["attention_mask"][batch_i].sum().item())
+        sep_id    = tokenizer.sep_token_id
+        sep_pos   = (input_ids == sep_id).nonzero(as_tuple=True)[0]
+        sep_idx   = int(sep_pos[0].item()) if len(sep_pos) > 0 else n_tokens // 2
+
+        cov_a2b, cov_b2a = _max_alignment_coverage(avg_attn, sep_idx, n_tokens)
+        nis = _novel_information_score(avg_attn, sep_idx, n_tokens)
+
+        results.append({
+            "raw_logit":        round(raw_logit, 4),
+            "prob_duplicate":   round(prob_dup, 4),
+            "coverage_a_to_b":  round(cov_a2b, 4),
+            "coverage_b_to_a":  round(cov_b2a, 4),
+            "nis_b_given_a":    nis,
+        })
 
     return results
 

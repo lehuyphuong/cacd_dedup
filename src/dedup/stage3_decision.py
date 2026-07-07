@@ -214,7 +214,16 @@ def _sentence_level_merge(
         (None, None, None)                         if no novel content found
     """
     import re
-    from src.dedup.stage2_cross_attention import score_pair as _score_pair
+    from src.dedup.stage2_cross_attention import score_sentences_batched
+
+    # Early exit (speed only, does not change any outcome): the accepted
+    # novel_text built below is always a subset of chunk_text's own
+    # sentences, so its length can never exceed len(chunk_text). If
+    # chunk_text itself is already shorter than MIN_NOVEL_CHARS, no possible
+    # combination of its sentences could ever pass the Step 7 floor check —
+    # skip sentence splitting and all scoring entirely in that case.
+    if len(chunk_text) < MIN_NOVEL_CHARS:
+        return None, None, None
 
     # Step 1 — split A into sentences
     sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', chunk_text.strip()) if s.strip()]
@@ -243,17 +252,26 @@ def _sentence_level_merge(
     #
     # Note on direction: CrossEncoder(Bⱼ, sᵢ) sets Bⱼ as A and sᵢ as B,
     # so NIS measures "how much of sᵢ is novel relative to Bⱼ" — correct direction.
+    #
+    # Speed note: this loops over candidates (few — at most K, and typically
+    # fewer once restricted to the same document) and, for each, scores ALL
+    # sentences in a single batched forward pass via score_sentences_batched.
+    # This computes the exact same (sentence, candidate) NIS values as calling
+    # score_pair(cand["text"], sent) once per pair — only the batching
+    # changes, not the math — turning m*k single-pair forward passes into
+    # k batched ones.
+
+    # nis_per_sentence[i] = list of (candidate, nis) for sentence i, one entry per candidate
+    nis_per_sentence: list[list[tuple[dict, float]]] = [[] for _ in sentences]
+
+    for cand in same_doc_candidates:
+        batch_results = score_sentences_batched(cand["text"], sentences)
+        for i, result in enumerate(batch_results):
+            nis_per_sentence[i].append((cand, result["nis_b_given_a"]))
 
     novel_sentences_by_target: dict[str, list[str]] = {}  # {candidate_chunk_id: [sentences]}
 
-    for sent in sentences:
-        nis_scores = []
-        for cand in same_doc_candidates:
-            # score_pair(text_a=Bⱼ, text_b=sᵢ): Bⱼ is the "known" context (A in NIS),
-            # sᵢ is the "new" text (B in NIS) — gives NIS(sᵢ | Bⱼ)
-            result = _score_pair(cand["text"], sent)
-            nis_scores.append((cand, result["nis_b_given_a"]))
-
+    for sent, nis_scores in zip(sentences, nis_per_sentence):
         min_nis_cand, min_nis_val = min(nis_scores, key=lambda x: x[1])
 
         if min_nis_val > NIS_SENTENCE_NOVEL:

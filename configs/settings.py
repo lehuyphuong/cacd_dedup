@@ -53,6 +53,14 @@ EMBED_BATCH_SIZE = 512 if torch.cuda.is_available() else 128
 # ── CACD — Stage 1 (Coarse retrieval) ────────────────────────────────────────
 CACD_TOP_K_CANDIDATES = 5   # top-K nearest neighbours retrieved from HNSW per chunk
 
+# Mixed-precision (FP16) inference for the cross-encoder. Only takes effect
+# when running on CUDA (torch.autocast on CPU gives no speedup and is not
+# what this flag is for); on CPU-only runs this is a no-op regardless of
+# the value below. Expected to noticeably speed up Stage 2 / merge scoring
+# on GPU with negligible effect on logits/NIS (values a few decimal places
+# off at most — far from enough to flip any KEEP/DROP decision in practice).
+CACD_USE_FP16 = True
+
 # ── CACD — Stage 2 (Cross-attention) ─────────────────────────────────────────
 # Pretrained, no fine-tuning. Selected after a 37-model comparison experiment;
 # cross-encoder/msmarco-MiniLM-L6-en-de-v1 is the most commonly used baseline
