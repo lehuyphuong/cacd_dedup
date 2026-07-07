@@ -179,7 +179,6 @@ def _novel_information_score(
 
 
 @torch.no_grad()
-@torch.no_grad()
 def score_pair(text_a: str, text_b: str) -> dict:
     """
     Score the redundancy of one pair (text_a, text_b) via the cross-encoder.
@@ -327,6 +326,9 @@ def score_candidates_batched(
     outputs = None
     with _autocast_ctx():
         outputs = model(**inputs)
+
+    logits_batch    = outputs.logits          # (batch, num_labels)
+    attentions_last = outputs.attentions[-1]  # (batch, num_heads, seq, seq)
 
     for batch_i, (orig_i, cand) in enumerate(to_score):
         logits = logits_batch[batch_i]
