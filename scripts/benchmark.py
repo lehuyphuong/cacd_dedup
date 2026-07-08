@@ -41,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from configs.settings import CHUNKING_CONFIGS, EMBED_BATCH_SIZE, RESULTS_DIR, TOP_K
 from src.dedup.stage3_decision import PROB_HIGH, PROB_LOW, NIS_DROP_THRESHOLD, run_cacd_dedup
+from src.dedup.stage2_cross_attention import get_cross_encoder
 from src.evaluation.metrics import compute_retrieval_metrics
 from src.ingestion.chunker import chunk_documents
 from src.ingestion.embedder import embed_chunks_batched, embed_texts
@@ -283,6 +284,25 @@ def main() -> None:
             sys.exit(1)
 
     logger.info("Running %d configs.", len(configs))
+
+    # ── Warm up both lazy-loaded models BEFORE the timed loop ──────────────
+    # get_model() (bi-encoder, used by embed_chunks_batched/embed_texts) and
+    # get_cross_encoder() (Stage 2) are both cached on first call via module-
+    # level globals — so without an explicit warmup here, the FIRST config
+    # processed below would silently pay the one-time model-loading cost
+    # inside its measured ingest_time, while every later config would not.
+    # That made the first config's ingest_time incomparable to the rest
+    # (e.g. FixedSize_200 processed first showed ~812s including load time,
+    # vs FixedSize_400 processed second at ~318s with no load time at all).
+    # Warming up here ensures every config's ingest_time reflects only
+    # chunking + embedding + CACD dedup, nothing else.
+    t_warmup = time.perf_counter()
+    _ = embed_texts(["warmup"])
+    _ = get_cross_encoder()
+    logger.info(
+        "Model warmup done in %.2fs (excluded from all per-config ingest_time below).",
+        time.perf_counter() - t_warmup,
+    )
 
     summary_path = RESULTS_DIR / "benchmark_results.csv"
     is_new       = not summary_path.exists()
