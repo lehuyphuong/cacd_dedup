@@ -34,6 +34,7 @@ import numpy as np
 from configs.settings import (
     CACD_COST_FALSE_NEGATIVE,
     CACD_COST_FALSE_POSITIVE,
+    CACD_ENABLE_MERGE,
     HEATMAP_DIR,
     NIS_SENTENCE_NOVEL,
     MIN_NOVEL_CHARS,
@@ -562,7 +563,7 @@ def run_cacd_dedup(
         if decision == "keep":
             kept_chunks.append(chunk)
             upsert_chunks(cname, [chunk], [vec])
-        else:
+        elif CACD_ENABLE_MERGE:
             # decision == "drop" — attempt sentence-level merge before discarding
             if embed_fn is not None:
                 logger.info(
@@ -587,6 +588,8 @@ def run_cacd_dedup(
                         "  MERGE skipped: no novel content found in chunk '%s' => pure drop",
                         chunk["chunk_id"],
                     )
+        # else: CACD_ENABLE_MERGE is False => pure drop, no sentence splitting,
+        # no extra cross-encoder calls at all — chunk is simply not inserted.
 
         if (i + 1) % 50 == 0:
             n_dropped = (i + 1) - len(kept_chunks)

@@ -197,6 +197,15 @@ CHUNKING_CONFIGS = _make_configs()
 #      after merge (already done in _sentence_level_merge) only fixes staleness
 #      if the text handed to it is short enough to be embedded in full — this
 #      cap is what actually guarantees that.
+# Master switch for the sentence-level merge step (Section III-G / Algorithm 2).
+# Default OFF: merge is the dominant cost driver (many extra per-sentence
+# cross-encoder passes on every dropped chunk) and also grows the index
+# (appended text), which is why CACD-with-merge ended up larger and much
+# slower than NERExact despite better Precision/IoU. Set to True to restore
+# the previous behaviour (e.g. for an A/B comparison) without deleting the
+# merge implementation itself.
+CACD_ENABLE_MERGE = False
+
 MERGE_SAME_DOC_ONLY       = True
 MERGE_MAX_SIZE_MULTIPLIER = 2.0
 MERGE_MAX_EMBED_CHARS     = 900
