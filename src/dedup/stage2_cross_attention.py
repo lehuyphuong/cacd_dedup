@@ -447,6 +447,94 @@ def score_sentences_batched(candidate_text: str, sentences: list[str]) -> list[d
     return results
 
 
+@torch.no_grad()
+def score_pairs_batched(
+    pairs: list[tuple[str, str]],
+    sub_batch_size: int = 128,
+) -> list[dict]:
+    """
+    Fully general batched scoring: unlike score_candidates_batched (one A,
+    many B) or score_sentences_batched (one A per call, many B), here BOTH
+    text_a and text_b vary independently per pair. This is what lets Stage 2
+    batch across MULTIPLE new chunks at once (each chunk = a different A,
+    each with its own K candidates = different B's), instead of one forward
+    pass per chunk.
+
+    Internally chunks the pair list into sub-batches of `sub_batch_size` to
+    bound peak memory (attention tensors are O(batch x heads x seq x seq));
+    each sub-batch is still a single forward pass, so this is still k
+    forward passes total for k = ceil(len(pairs)/sub_batch_size), not one
+    pair at a time.
+
+    Callers are responsible for any guard filtering (parent-child skip,
+    header stripping) before building `pairs` — this function does no
+    guarding of its own, matching score_sentences_batched's contract.
+
+    Input:
+        pairs          : list of (text_a, text_b) tuples.
+        sub_batch_size : max pairs per forward pass (memory safety valve).
+
+    Returns:
+        list of dicts, one per pair, in the same order as `pairs`, each
+        with the same fields as score_pair (raw_logit, prob_duplicate,
+        coverage_a_to_b, coverage_b_to_a, nis_b_given_a).
+    """
+    if not pairs:
+        return []
+
+    tokenizer, model = get_cross_encoder()
+    results: list[dict] = []
+
+    for start in range(0, len(pairs), sub_batch_size):
+        sub = pairs[start:start + sub_batch_size]
+        texts_a = [p[0] for p in sub]
+        texts_b = [p[1] for p in sub]
+
+        inputs = tokenizer(
+            texts_a, texts_b,
+            return_tensors="pt",
+            truncation=True,
+            max_length=256,
+            padding=True,
+        ).to(DEVICE)
+
+        with _autocast_ctx():
+            outputs = model(**inputs)
+
+        logits_batch    = outputs.logits
+        attentions_last  = outputs.attentions[-1]
+
+        for batch_i in range(len(sub)):
+            logits = logits_batch[batch_i]
+            if logits.dim() == 0 or logits.shape[0] == 1:
+                prob_dup  = float(torch.sigmoid(logits.squeeze()).item())
+                raw_logit = logits.squeeze().item()
+            else:
+                prob_dup  = float(torch.softmax(logits, dim=-1)[-1].item())
+                raw_logit = logits[-1].item()
+
+            avg_attn = attentions_last[batch_i].mean(dim=0)
+
+            input_ids = inputs["input_ids"][batch_i]
+            n_tokens  = int(inputs["attention_mask"][batch_i].sum().item())
+            sep_id    = tokenizer.sep_token_id
+            sep_pos   = (input_ids == sep_id).nonzero(as_tuple=True)[0]
+            sep_idx   = int(sep_pos[0].item()) if len(sep_pos) > 0 else n_tokens // 2
+
+            cov_a2b, cov_b2a = _max_alignment_coverage(avg_attn, sep_idx, n_tokens)
+            nis = _novel_information_score(avg_attn, sep_idx, n_tokens)
+
+            results.append({
+                "raw_logit":       round(raw_logit, 4),
+                "prob_duplicate":  round(prob_dup, 4),
+                "coverage_a_to_b": round(cov_a2b, 4),
+                "coverage_b_to_a": round(cov_b2a, 4),
+                "nis_b_given_a":   nis,
+            })
+
+    return results
+
+
 def score_candidates(
     chunk_text: str,
     candidates: list[dict],

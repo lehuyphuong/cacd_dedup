@@ -24,6 +24,7 @@ controlling most decisions.
 from __future__ import annotations
 
 import logging
+import math
 from pathlib import Path
 
 import matplotlib
@@ -35,6 +36,7 @@ from configs.settings import (
     CACD_COST_FALSE_NEGATIVE,
     CACD_COST_FALSE_POSITIVE,
     CACD_ENABLE_MERGE,
+    CACD_INGEST_BATCH_SIZE,
     HEATMAP_DIR,
     NIS_SENTENCE_NOVEL,
     MIN_NOVEL_CHARS,
@@ -44,7 +46,12 @@ from configs.settings import (
 )
 from src.dedup.calibration import bayes_optimal_cutoff
 from src.dedup.stage1_coarse_retrieval import batch_coarse_retrieve
-from src.dedup.stage2_cross_attention import score_candidates
+from src.dedup.stage2_cross_attention import (
+    score_candidates,
+    score_pairs_batched,
+    _is_parent_child_pair,
+    _strip_contextual_header,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -369,127 +376,95 @@ def run_cacd_dedup(
     save_heatmaps: bool = True,
     max_heatmaps: int = 30,
     chunk_size: int = 400,
+    micro_batch_size: int | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """
     Run the full CACD pipeline (Stage 1 => 2 => 3 + Merge) for one batch
     of chunks being ingested into collection `cname`.
 
-    Chunks are processed sequentially: for each chunk, Stage 1 retrieves
-    candidates from the current index, Stage 2 scores them, Stage 3 votes
-    drop or keep. When DROP is decided, sentence-level merge is attempted:
-    novel sentences from the dropped chunk are appended to the most relevant
-    SAME-DOCUMENT candidate (see MERGE_SAME_DOC_ONLY) and upserted back into
-    Qdrant (overwriting the old version), subject to a size cap
-    (MERGE_MAX_SIZE_MULTIPLIER / MERGE_MAX_EMBED_CHARS).
+    Chunks are processed in MICRO-BATCHES of `micro_batch_size` (default
+    CACD_INGEST_BATCH_SIZE), not one at a time. Within a micro-batch:
+      1. Stage 1 retrieves candidates for every chunk in the batch against
+         the index as it stood at the START of the batch (no chunk in a
+         batch sees another chunk from the SAME batch — see trade-off note
+         below).
+      2. All (chunk, candidate) pairs across the whole batch are flattened
+         into one list and scored in as few cross-encoder forward passes
+         as possible via score_pairs_batched, instead of one forward pass
+         per chunk (previously: N chunks = N forward passes of K=5 pairs
+         each; now: N chunks = ceil(N*K / sub_batch_size) forward passes).
+      3. Stage 3's per-candidate vote + majority decision runs per chunk,
+         identical logic to the previous fully-sequential version (see
+         _vote_decision below — factored out but byte-for-byte the same
+         rule as before).
+      4. All KEPT (and, if enabled, merged) chunks in the batch are
+         upserted into Qdrant in ONE batched call at the end of the batch,
+         rather than one upsert per chunk.
+
+    Trade-off (staleness within a batch): because Stage 1 retrieval for the
+    whole batch happens before any of the batch's decisions are known,
+    two near-duplicate chunks that both land in the SAME micro-batch will
+    not detect each other (each only sees chunks already indexed before
+    the batch started). Smaller micro_batch_size shrinks this blind spot;
+    micro_batch_size=1 reproduces the exact old fully-sequential behaviour.
+    This is a deliberate speed/staleness trade-off, not a bug — see
+    Section III-G limitations discussion for the analogous trade-off in
+    the (currently disabled) merge step.
+
+    When DROP is decided and CACD_ENABLE_MERGE is True, sentence-level
+    merge is attempted exactly as before (unchanged, still processed one
+    chunk at a time since merge is off by default and not the bottleneck
+    this restructuring targets — see Section III-G / CACD_ENABLE_MERGE).
 
     Args:
-        chunks       : list of chunk dicts with embeddings pre-computed.
-        dense_vecs   : embedding vector for each chunk (same order).
-        cname        : Qdrant collection name (empty at start of ingest).
-        config_name  : benchmark config label (for heatmap paths and logs).
-        embed_fn     : callable(list[str]) => list[list[float]].
-                       Required for sentence-level merge to re-embed B_merged.
-                       If None, merge is skipped and DROP behaves as before.
-        save_heatmaps: whether to save attention heatmaps.
-        max_heatmaps : maximum heatmaps per config.
-        chunk_size   : configured target chunk size (chars) for the current
-                       chunking strategy — used to scale the merge size cap.
+        chunks           : list of chunk dicts with embeddings pre-computed.
+        dense_vecs       : embedding vector for each chunk (same order).
+        cname            : Qdrant collection name (empty at start of ingest).
+        config_name      : benchmark config label (for heatmap paths/logs).
+        embed_fn         : callable(list[str]) => list[list[float]].
+                           Required for sentence-level merge to re-embed
+                           B_merged. If None, merge is skipped.
+        save_heatmaps    : whether to save attention heatmaps.
+        max_heatmaps     : maximum heatmaps per config.
+        chunk_size       : configured target chunk size (chars) for the
+                           current chunking strategy — used to scale the
+                           merge size cap.
+        micro_batch_size : chunks scored together per Stage 2 forward-pass
+                           batch. Defaults to CACD_INGEST_BATCH_SIZE.
 
     Returns:
         (kept_chunks, audit_log)
     """
     from src.ingestion.vector_store import upsert_chunks
 
+    if micro_batch_size is None:
+        micro_batch_size = CACD_INGEST_BATCH_SIZE
+
     kept_chunks: list[dict] = []
     audit_log:   list[dict] = []
-    n_heatmaps_saved = 0
 
-    for i, (chunk, vec) in enumerate(zip(chunks, dense_vecs)):
-        # Stage 1 — coarse retrieval on the CURRENT index (includes chunks
-        # inserted in earlier iterations of the same ingest pass).
-        candidates_list, _ = batch_coarse_retrieve(
-            [chunk], [vec], cname, top_k=None,
-        )
-        candidates = candidates_list[0] if candidates_list else []
-
-        if not candidates:
-            # No neighbours in the index yet => definitely not a duplicate.
-            kept_chunks.append(chunk)
-            upsert_chunks(cname, [chunk], [vec])
-            audit_log.append({
-                "chunk_id":          chunk["chunk_id"],
-                "decision":          "keep",
-                "reason":            "no_candidates",
-                "best_p_duplicate":  0.0,
-                "best_candidate_id": "",
-            })
-            continue
-
-        # Stage 2 — cross-attention scoring.
-        # Pass parent_id and level to skip parent-child pairs, and strip
-        # the contextual header before scoring to avoid false redundancy.
-        scored = score_candidates(
-            chunk["text"],
-            candidates,
-            chunk_parent_id=chunk.get("parent_id"),
-            chunk_level=chunk.get("level"),
-        )
-
-        # Redundancy signal for audit log (not used in the decision).
-        for s in scored:
-            s["redundancy_signal"] = min(
-                s["coverage_a_to_b"], s["coverage_b_to_a"]
-            )
-
-        # Exclude skipped parent-child candidates before selecting the best.
-        valid_scored = [s for s in scored if not s.get("skipped", False)]
-
-        if not valid_scored:
-            # All candidates were parent-child pairs => nothing to dedup against.
-            kept_chunks.append(chunk)
-            upsert_chunks(cname, [chunk], [vec])
-            audit_log.append({
-                "chunk_id":          chunk["chunk_id"],
-                "decision":          "keep",
-                "reason":            "all_candidates_skipped",
-                "best_p_duplicate":  0.0,
-                "best_candidate_id": "",
-                "nis_b_given_a":     1.0,
-                "coverage_a_to_b":   0.0,
-                "coverage_b_to_a":   0.0,
-                "redundancy_signal": 0.0,
-                "prob_high":         round(PROB_HIGH, 4),
-                "prob_low":          round(PROB_LOW, 4),
-                "nis_threshold":     NIS_DROP_THRESHOLD,
-            })
-            continue
-
-        # Stage 3 — Early-exit majority voting across K candidates.
-        #
-        # Each valid candidate votes independently DROP or KEEP using the
-        # same 3-zone decision rule + length-aware guard as before.
-        # Voting stops as soon as one side reaches ceil(K/2) votes.
-        #
-        # Rationale: the original design dropped a chunk whenever the single
-        # highest-scoring candidate triggered DROP, even if K-1 other
-        # candidates all voted KEEP. A single Stage 1 retrieval artifact
-        # (a false positive from HNSW) could therefore cause a false drop.
-        # Majority voting requires genuine consensus before committing to DROP.
-
-        import math
+    def _vote_decision(chunk: dict, valid_scored: list[dict]):
+        """
+        Stage 3 — early-exit majority voting across K candidates. Identical
+        rule to the original fully-sequential implementation (Eq. 6 / the
+        Vote(A,B) function): each valid candidate votes KEEP/DROP using the
+        3-zone decision + length-aware guard, tallied with early exit at
+        ceil(|valid_scored| / 2). Factored out here so the same exact logic
+        runs whether chunks are processed one at a time or in a batch —
+        this refactor changes nothing about the decision itself.
+        """
         chunk_len  = len(chunk["text"])
         majority   = math.ceil(len(valid_scored) / 2)
         votes_drop = 0
         votes_keep = 0
         decision   = None
         reason     = ""
-        best       = None   # candidate that cast the deciding vote
+        best       = None
 
         for cand in valid_scored:
             prob = cand["prob_duplicate"]
             nis  = cand["nis_b_given_a"]
 
-            # Same 3-zone + length-aware guard logic as before, applied per candidate
             if prob >= PROB_HIGH:
                 if chunk_len > LENGTH_GUARD and nis > NIS_FLOOR:
                     vote        = "keep"
@@ -517,7 +492,6 @@ def run_cacd_dedup(
             else:
                 votes_keep += 1
 
-            # Early exit: first side to reach majority wins
             if votes_drop >= majority:
                 decision = "drop"
                 reason   = f"voting_drop ({votes_drop}/{len(valid_scored)} >= {majority}) | deciding: {vote_reason}"
@@ -529,81 +503,184 @@ def run_cacd_dedup(
                 best     = cand
                 break
 
-        # Fallback: no majority reached (e.g. only 1 candidate after guard filtering)
-        # => default KEEP to avoid silent data loss
         if decision is None:
             decision = "keep"
             reason   = f"voting_no_majority (drop={votes_drop}, keep={votes_keep}) => default keep"
             best     = valid_scored[-1]
 
-        # Heatmap saving is disabled to reduce ingest time.
-        # Uncomment for visual analysis:
-        # if save_heatmaps and n_heatmaps_saved < max_heatmaps:
-        #     save_heatmap(
-        #         best, chunk["chunk_id"], best["chunk_id"],
-        #         config_name, decision,
-        #     )
-        #     n_heatmaps_saved += 1
+        return decision, reason, best
 
-        audit_log.append({
-            "chunk_id":           chunk["chunk_id"],
-            "decision":           decision,
-            "reason":             reason,
-            "best_p_duplicate":   best["prob_duplicate"],
-            "best_candidate_id":  best["chunk_id"],
-            "nis_b_given_a":      best["nis_b_given_a"],
-            "coverage_a_to_b":    best["coverage_a_to_b"],
-            "coverage_b_to_a":    best["coverage_b_to_a"],
-            "redundancy_signal":  best["redundancy_signal"],
-            "prob_high":          round(PROB_HIGH, 4),
-            "prob_low":           round(PROB_LOW, 4),
-            "nis_threshold":      NIS_DROP_THRESHOLD,
-        })
+    n = len(chunks)
 
-        if decision == "keep":
-            kept_chunks.append(chunk)
-            upsert_chunks(cname, [chunk], [vec])
-        elif CACD_ENABLE_MERGE:
-            # decision == "drop" — attempt sentence-level merge before discarding
-            if embed_fn is not None:
-                logger.info(
-                    "  Attempting merge for dropped chunk '%s' (best_p=%.3f)",
-                    chunk["chunk_id"], best["prob_duplicate"],
+    for batch_start in range(0, n, micro_batch_size):
+        batch_end    = min(batch_start + micro_batch_size, n)
+        batch_chunks = chunks[batch_start:batch_end]
+        batch_vecs   = dense_vecs[batch_start:batch_end]
+
+        # ── Stage 1 (whole batch, one index snapshot) ───────────────────
+        candidates_list, _ = batch_coarse_retrieve(
+            batch_chunks, batch_vecs, cname, top_k=None,
+        )
+        if not candidates_list:
+            candidates_list = [[] for _ in batch_chunks]
+
+        # ── Build the flat (text_a, text_b) pair list for Stage 2,
+        # applying the same guards as before (parent-child skip, header
+        # strip) BEFORE scoring so guarded-out pairs never reach the model ──
+        pending_status:  list[str]       = []   # "no_candidates" | "all_skipped" | "scored"
+        pending_valid:   list[list[dict]] = []  # valid (post-guard) candidates per chunk
+        flat_pairs:      list[tuple[str, str]] = []
+        flat_owner:      list[int] = []         # index into batch_chunks
+        flat_cand:       list[dict] = []
+
+        for bi, chunk in enumerate(batch_chunks):
+            cands = candidates_list[bi] if bi < len(candidates_list) else []
+            if not cands:
+                pending_status.append("no_candidates")
+                pending_valid.append([])
+                continue
+
+            valid_for_chunk = [
+                cand for cand in cands
+                if not _is_parent_child_pair(
+                    chunk.get("parent_id"), chunk.get("level"),
+                    cand.get("parent_id"), cand.get("level"),
+                    cand["chunk_id"],
                 )
-                B_merged, target_cand, B_merged_vec = _sentence_level_merge(
-                    chunk["text"], chunk["doc_id"], chunk_size, valid_scored, embed_fn,
-                )
-                if B_merged is not None:
-                    # Upsert B_merged — same chunk_id as B => overwrites B in Qdrant
-                    upsert_chunks(cname, [B_merged], [B_merged_vec])
-                    audit_log[-1]["decision"]      = "merge"
-                    audit_log[-1]["reason"]        += f" | merged into '{target_cand['chunk_id']}'"
-                    audit_log[-1]["merged_into"]   = target_cand["chunk_id"]
-                    logger.info(
-                        "  MERGE done: chunk '%s' merged into '%s'",
-                        chunk["chunk_id"], target_cand["chunk_id"],
-                    )
-                else:
-                    logger.info(
-                        "  MERGE skipped: no novel content found in chunk '%s' => pure drop",
-                        chunk["chunk_id"],
-                    )
-        # else: CACD_ENABLE_MERGE is False => pure drop, no sentence splitting,
-        # no extra cross-encoder calls at all — chunk is simply not inserted.
+            ]
+            if not valid_for_chunk:
+                pending_status.append("all_skipped")
+                pending_valid.append([])
+                continue
 
-        if (i + 1) % 50 == 0:
-            n_dropped = (i + 1) - len(kept_chunks)
-            logger.info(
-                "  CACD progress: %d/%d | kept=%d | dropped=%d | "
-                "prob_range=[%.2f,%.2f] | nis_thresh=%.2f",
-                i + 1, len(chunks), len(kept_chunks), n_dropped,
-                PROB_LOW, PROB_HIGH, NIS_DROP_THRESHOLD,
+            pending_status.append("scored")
+            pending_valid.append(valid_for_chunk)
+            a_clean = _strip_contextual_header(chunk["text"])
+            for cand in valid_for_chunk:
+                b_clean = _strip_contextual_header(cand["text"])
+                flat_pairs.append((a_clean, b_clean))
+                flat_owner.append(bi)
+                flat_cand.append(cand)
+
+        # ── Stage 2 (whole batch, as few forward passes as possible) ────
+        flat_results = score_pairs_batched(flat_pairs) if flat_pairs else []
+
+        scored_per_chunk: list[list[dict]] = [[] for _ in batch_chunks]
+        for owner_bi, cand, result in zip(flat_owner, flat_cand, flat_results):
+            merged = dict(cand)
+            merged.update(result)
+            merged["redundancy_signal"] = min(
+                result["coverage_a_to_b"], result["coverage_b_to_a"]
             )
+            scored_per_chunk[owner_bi].append(merged)
+
+        # ── Stage 3 (per chunk, same rule as always) + collect upserts ──
+        to_upsert_chunks: list[dict] = []
+        to_upsert_vecs:   list[list[float]] = []
+
+        for bi, chunk in enumerate(batch_chunks):
+            vec         = batch_vecs[bi]
+            global_i    = batch_start + bi
+            status      = pending_status[bi]
+
+            if status == "no_candidates":
+                kept_chunks.append(chunk)
+                to_upsert_chunks.append(chunk)
+                to_upsert_vecs.append(vec)
+                audit_log.append({
+                    "chunk_id":          chunk["chunk_id"],
+                    "decision":          "keep",
+                    "reason":            "no_candidates",
+                    "best_p_duplicate":  0.0,
+                    "best_candidate_id": "",
+                })
+                continue
+
+            if status == "all_skipped":
+                kept_chunks.append(chunk)
+                to_upsert_chunks.append(chunk)
+                to_upsert_vecs.append(vec)
+                audit_log.append({
+                    "chunk_id":           chunk["chunk_id"],
+                    "decision":           "keep",
+                    "reason":             "all_candidates_skipped",
+                    "best_p_duplicate":   0.0,
+                    "best_candidate_id":  "",
+                    "nis_b_given_a":      1.0,
+                    "coverage_a_to_b":    0.0,
+                    "coverage_b_to_a":    0.0,
+                    "redundancy_signal":  0.0,
+                    "prob_high":          round(PROB_HIGH, 4),
+                    "prob_low":           round(PROB_LOW, 4),
+                    "nis_threshold":      NIS_DROP_THRESHOLD,
+                })
+                continue
+
+            valid_scored = scored_per_chunk[bi]
+            decision, reason, best = _vote_decision(chunk, valid_scored)
+
+            audit_log.append({
+                "chunk_id":           chunk["chunk_id"],
+                "decision":           decision,
+                "reason":             reason,
+                "best_p_duplicate":   best["prob_duplicate"],
+                "best_candidate_id":  best["chunk_id"],
+                "nis_b_given_a":      best["nis_b_given_a"],
+                "coverage_a_to_b":    best["coverage_a_to_b"],
+                "coverage_b_to_a":    best["coverage_b_to_a"],
+                "redundancy_signal":  best["redundancy_signal"],
+                "prob_high":          round(PROB_HIGH, 4),
+                "prob_low":           round(PROB_LOW, 4),
+                "nis_threshold":      NIS_DROP_THRESHOLD,
+            })
+
+            if decision == "keep":
+                kept_chunks.append(chunk)
+                to_upsert_chunks.append(chunk)
+                to_upsert_vecs.append(vec)
+            elif CACD_ENABLE_MERGE:
+                if embed_fn is not None:
+                    logger.info(
+                        "  Attempting merge for dropped chunk '%s' (best_p=%.3f)",
+                        chunk["chunk_id"], best["prob_duplicate"],
+                    )
+                    B_merged, target_cand, B_merged_vec = _sentence_level_merge(
+                        chunk["text"], chunk["doc_id"], chunk_size, valid_scored, embed_fn,
+                    )
+                    if B_merged is not None:
+                        to_upsert_chunks.append(B_merged)
+                        to_upsert_vecs.append(B_merged_vec)
+                        audit_log[-1]["decision"]    = "merge"
+                        audit_log[-1]["reason"]      += f" | merged into '{target_cand['chunk_id']}'"
+                        audit_log[-1]["merged_into"] = target_cand["chunk_id"]
+                        logger.info(
+                            "  MERGE done: chunk '%s' merged into '%s'",
+                            chunk["chunk_id"], target_cand["chunk_id"],
+                        )
+                    else:
+                        logger.info(
+                            "  MERGE skipped: no novel content found in chunk '%s' => pure drop",
+                            chunk["chunk_id"],
+                        )
+            # else: CACD_ENABLE_MERGE is False => pure drop, nothing upserted.
+
+            if (global_i + 1) % 50 == 0:
+                n_dropped = (global_i + 1) - len(kept_chunks)
+                logger.info(
+                    "  CACD progress: %d/%d | kept=%d | dropped=%d | "
+                    "prob_range=[%.2f,%.2f] | nis_thresh=%.2f | batch_size=%d",
+                    global_i + 1, n, len(kept_chunks), n_dropped,
+                    PROB_LOW, PROB_HIGH, NIS_DROP_THRESHOLD, micro_batch_size,
+                )
+
+        # ── One batched upsert for everything kept/merged in this batch ──
+        if to_upsert_chunks:
+            upsert_chunks(cname, to_upsert_chunks, to_upsert_vecs)
 
     logger.info(
         "  CACD done: %d => %d chunks kept "
-        "(prob_range=[%.2f,%.2f], nis_thresh=%.2f)",
+        "(prob_range=[%.2f,%.2f], nis_thresh=%.2f, batch_size=%d)",
         len(chunks), len(kept_chunks),
-        PROB_LOW, PROB_HIGH, NIS_DROP_THRESHOLD,
+        PROB_LOW, PROB_HIGH, NIS_DROP_THRESHOLD, micro_batch_size,
     )
     return kept_chunks, audit_log

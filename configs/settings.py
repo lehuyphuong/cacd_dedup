@@ -51,7 +51,35 @@ TEXT_EMBED_DIM   = 384
 EMBED_BATCH_SIZE = 512 if torch.cuda.is_available() else 128
 
 # ── CACD — Stage 1 (Coarse retrieval) ────────────────────────────────────────
+# Number of new chunks scored together in a single Stage 2 forward-pass
+# batch during ingestion, instead of one chunk (K=5 pairs) at a time.
+# Trade-off: chunks within the same micro-batch are all checked against the
+# SAME index snapshot (as of the start of the batch) — they cannot see each
+# other, only chunks already in the index before the batch began. Smaller
+# values = less staleness, closer to fully sequential; larger values =
+# fewer, bigger forward passes = faster, at the cost of a larger blind spot
+# within each batch. Set to 1 to reproduce the old fully-sequential behavior
+# exactly.
+CACD_INGEST_BATCH_SIZE = 32
+
 CACD_TOP_K_CANDIDATES = 5   # top-K nearest neighbours retrieved from HNSW per chunk
+
+# Micro-batch size for Stage 1 + Stage 2: instead of processing chunks one
+# at a time (Stage 1 batch=1, Stage 2 batch=K=5), chunks are processed in
+# windows of this size. Stage 1 issues ONE batched Qdrant query for the
+# whole window (already supported by batch_coarse_retrieve, previously
+# called with a 1-chunk list); Stage 2 flattens every (chunk, candidate)
+# pair across the whole window into ONE cross-encoder forward pass via
+# score_multi_chunks_batched, instead of window_size separate K=5-pair calls.
+#
+# Trade-off (accepted, see conversation): all chunks within one window are
+# checked against the index as it stood at the START of the window — they
+# do not see each other, even if an earlier chunk in the same window would
+# have been kept. Only the window boundary introduces this staleness;
+# chunks in different windows are still fully sequential relative to each
+# other. Larger values = fewer, bigger forward passes (faster, more stale);
+# smaller values = closer to the original fully-sequential behaviour.
+CACD_MICROBATCH_SIZE = 32
 
 # Mixed-precision (FP16) inference for the cross-encoder. Only takes effect
 # when running on CUDA (torch.autocast on CPU gives no speedup and is not
