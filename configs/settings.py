@@ -60,7 +60,7 @@ EMBED_BATCH_SIZE = 512 if torch.cuda.is_available() else 128
 # fewer, bigger forward passes = faster, at the cost of a larger blind spot
 # within each batch. Set to 1 to reproduce the old fully-sequential behavior
 # exactly.
-CACD_INGEST_BATCH_SIZE = 32
+CACD_INGEST_BATCH_SIZE = 128
 
 CACD_TOP_K_CANDIDATES = 5   # top-K nearest neighbours retrieved from HNSW per chunk
 
@@ -90,10 +90,21 @@ CACD_MICROBATCH_SIZE = 32
 CACD_USE_FP16 = True
 
 # ── CACD — Stage 2 (Cross-attention) ─────────────────────────────────────────
-# Pretrained, no fine-tuning. Selected after a 37-model comparison experiment;
-# cross-encoder/msmarco-MiniLM-L6-en-de-v1 is the most commonly used baseline
-# in the reranking literature (AugSBERT and related work).
-CACD_CROSS_ENCODER_MODEL = "cross-encoder/msmarco-MiniLM-L6-en-de-v1"
+# Original (paper-selected): cross-encoder/msmarco-MiniLM-L6-en-de-v1, chosen
+# after a 37-model comparison experiment; multilingual EN-DE MiniLM-L6.
+#
+# SPEED EXPERIMENT (current): swapped to cross-encoder/ms-marco-MiniLM-L4-v2.
+# WARNING — this is a DIFFERENT model family, not a smaller version of the
+# model above: the en-de-v1 family only ships L6/L12, no L4/L2 sibling. The
+# ms-marco-MiniLM-L-*-v2 family is the same MiniLM architecture but trained
+# on English-only MS MARCO data (not cross-lingual EN-DE). For a pure-English
+# benchmark (SQuAD 1.1) this is plausibly fine or even better-suited, but it
+# is a genuine model swap — re-run the 5-pair Model Selection sanity check
+# (experiment_model_comparison.py) AND CACD's own Precision/Recall/IoU before
+# trusting full-dataset results with this model. To revert to the
+# paper-selected model, restore the line below.
+CACD_CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L4-v2"
+# CACD_CROSS_ENCODER_MODEL = "cross-encoder/msmarco-MiniLM-L6-en-de-v1"  # paper-selected — restore to revert
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
