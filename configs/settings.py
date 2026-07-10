@@ -60,46 +60,7 @@ EMBED_BATCH_SIZE = 512 if torch.cuda.is_available() else 128
 # fewer, bigger forward passes = faster, at the cost of a larger blind spot
 # within each batch. Set to 1 to reproduce the old fully-sequential behavior
 # exactly.
-CACD_INGEST_BATCH_SIZE = 128
-
-# Number of (text_a, text_b) pairs sent to the cross-encoder in a single
-# forward pass inside score_pairs_batched, regardless of how many chunks
-# CACD_INGEST_BATCH_SIZE groups together. If one micro-batch of chunks
-# produces MORE pairs than this, score_pairs_batched splits them into
-# several forward passes automatically — so if this is set too low, it
-# silently caps how much CACD_INGEST_BATCH_SIZE can help. Raise this as far
-# as GPU memory allows (attention tensors are O(batch x heads x seq^2), so
-# watch VRAM when increasing) to let more chunks' pairs land in one real
-# forward pass. 512 is a starting point for a modern GPU with short
-# (<=256-token) inputs; lower it if you hit out-of-memory errors.
-# Whether to use the "only compute the last layer's attention" hook
-# optimization (see stage2_cross_attention.py). DEFAULT: DISABLED.
-#
-# Empirically REGRESSED performance rather than improving it: on a direct
-# GPU comparison (FixedSize_200/400), batch=128 WITH this hook measured
-# 200.5s / 85.2s, versus 102.2s / 46.8s for batch=128 WITHOUT it (and
-# 110.0s / 55.6s at batch=32 without it) — i.e. enabling the hook made
-# ingestion ~2x slower, not faster.
-#
-# Root cause: get_cross_encoder() loads the model with output_attentions=True
-# in from_pretrained(...) itself, which forces the WHOLE model onto the
-# slower "eager" attention implementation at LOAD time (a structural,
-# per-layer class choice), not a per-call runtime toggle. Setting
-# model.config.output_attentions=False afterward does not retroactively
-# swap any layer back to a faster fused kernel (SDPA/FlashAttention) —
-# every layer is already the same "eager" module either way, and attention
-# probabilities are computed as an unavoidable byproduct of every forward
-# pass regardless of output_attentions (that flag only controls whether the
-# tensor is additionally RETAINED in the output tuple). So the hook's
-# premise — that non-last layers could become cheaper — does not hold given
-# how this model is loaded, and the hook's own Python-level indirection
-# (pre-hook + post-hook on every call) was pure added overhead with no
-# offsetting saving. Left here (off) rather than deleted in case a future
-# loading strategy (e.g. a model loaded WITHOUT output_attentions=True,
-# with attention only forced on selectively) makes the premise valid again.
-CACD_USE_LAST_LAYER_ATTENTION_HOOK = False
-
-CACD_SUB_BATCH_SIZE = 128
+CACD_INGEST_BATCH_SIZE = 32
 
 CACD_TOP_K_CANDIDATES = 5   # top-K nearest neighbours retrieved from HNSW per chunk
 
@@ -129,19 +90,9 @@ CACD_MICROBATCH_SIZE = 32
 CACD_USE_FP16 = True
 
 # ── CACD — Stage 2 (Cross-attention) ─────────────────────────────────────────
-# Paper-selected model: cross-encoder/msmarco-MiniLM-L6-en-de-v1, chosen after
-# a 37-model comparison experiment; multilingual EN-DE MiniLM-L6.
-#
-# SPEED EXPERIMENT (abandoned): tried cross-encoder/ms-marco-MiniLM-L4-v2 as a
-# faster stand-in. Reverted for two reasons: (1) it is a different model
-# family (English-only MS MARCO training, not cross-lingual EN-DE — the
-# en-de-v1 family has no L4/L2 sibling to begin with), so its attention maps
-# are not directly comparable to what the NIS/heatmaps were designed around;
-# (2) PROB_HIGH/PROB_LOW/NIS_DROP_THRESHOLD were calibrated for L6's score
-# distribution and did not transfer — drop rate collapsed to ~0.16% on the
-# full run (CACD behaving almost like NoFilter), and recalibrating would not
-# have fixed the deeper issue of the attention maps themselves being off.
-# Back to L6; CACD_INGEST_BATCH_SIZE (below) remains the active speed lever.
+# Pretrained, no fine-tuning. Selected after a 37-model comparison experiment;
+# cross-encoder/msmarco-MiniLM-L6-en-de-v1 is the most commonly used baseline
+# in the reranking literature (AugSBERT and related work).
 CACD_CROSS_ENCODER_MODEL = "cross-encoder/msmarco-MiniLM-L6-en-de-v1"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

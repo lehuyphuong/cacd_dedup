@@ -29,166 +29,12 @@ import numpy as np
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-from configs.settings import (
-    CACD_CROSS_ENCODER_MODEL,
-    CACD_SUB_BATCH_SIZE,
-    CACD_USE_FP16,
-    CACD_USE_LAST_LAYER_ATTENTION_HOOK,
-    DEVICE,
-)
+from configs.settings import CACD_CROSS_ENCODER_MODEL, CACD_USE_FP16, DEVICE
 
 logger = logging.getLogger(__name__)
 
 _tokenizer = None
 _model     = None
-
-# State for the "only compute the last layer's attention" optimization.
-# Speed rationale: output_attentions=True at the top level makes EVERY
-# encoder layer retain its full (batch, heads, seq, seq) attention tensor
-# in the returned output, even though score_pair/score_candidates_batched/
-# score_sentences_batched/score_pairs_batched only ever use the LAST layer's
-# attention (see module docstring: "2b. Attention extraction: last layer").
-# The hook below forces ONLY the last layer's self-attention submodule to
-# compute+return its attention weights, while the model-level config is set
-# to output_attentions=False so the other layers don't retain theirs.
-#
-# This relies on the last layer's self-attention submodule receiving
-# `output_attentions` as a keyword argument from its caller (BertLayer /
-# BertAttention), which is the case for standard HF BERT-style models but
-# is not part of any stable public API guarantee — some model classes pass
-# it positionally instead, in which case the pre-hook below (which can only
-# rewrite kwargs, not positional args) would silently fail to force it.
-# _self_check_attention_hook() verifies the hook actually works, on real
-# data, before relying on it; if the check fails for any reason, the hook is
-# torn back down and every call transparently falls back to the original
-# output_attentions=True-for-all-layers behaviour. Either path returns
-# numerically identical last-layer attention weights — only how they're
-# obtained differs.
-_last_attn_capture: dict = {"tensor": None}
-_hook_enabled = False
-
-
-def _find_last_self_attention_module(model):
-    """Best-effort, generic lookup of <base_model>.encoder.layer[-1].attention.self
-    (the standard BERT/Electra/RoBERTa-style path). Returns None if the
-    model's structure doesn't match, so callers can fall back safely."""
-    try:
-        base = getattr(model, model.base_model_prefix, model)
-        encoder = getattr(base, "encoder", None)
-        if encoder is None or not hasattr(encoder, "layer") or len(encoder.layer) == 0:
-            return None
-        last_layer = encoder.layer[-1]
-        attn = getattr(last_layer, "attention", None)
-        self_attn = getattr(attn, "self", None) if attn is not None else None
-        return self_attn
-    except Exception:
-        return None
-
-
-def _install_last_layer_attention_hook(model) -> bool:
-    """Attach a pre-hook (forces output_attentions=True for this ONE
-    submodule's call) and a post-hook (captures the resulting attention
-    tensor) on the last encoder layer's self-attention module. Returns
-    False (no-op) if the module can't be located or this torch version
-    doesn't support kwarg-rewriting pre-hooks."""
-    global _hook_enabled
-
-    self_attn_module = _find_last_self_attention_module(model)
-    if self_attn_module is None:
-        logger.warning(
-            "Could not locate last-layer self-attention submodule for "
-            "hook-based extraction; using output_attentions=True for all "
-            "layers instead (safe default, slightly more memory/copy overhead)."
-        )
-        return False
-
-    def _pre_hook(module, args, kwargs):
-        kwargs = dict(kwargs)
-        kwargs["output_attentions"] = True
-        return args, kwargs
-
-    def _post_hook(module, args, output):
-        if isinstance(output, tuple) and len(output) > 1 and output[1] is not None:
-            _last_attn_capture["tensor"] = output[1]
-
-    try:
-        self_attn_module.register_forward_pre_hook(_pre_hook, with_kwargs=True)
-        self_attn_module.register_forward_hook(_post_hook)
-    except TypeError:
-        logger.warning(
-            "Installed torch version doesn't support kwarg-rewriting "
-            "forward_pre_hooks; using output_attentions=True for all layers."
-        )
-        return False
-
-    _hook_enabled = True
-    return True
-
-
-def _self_check_attention_hook(model, tokenizer) -> None:
-    """
-    Verifies the hook actually captures the correct tensor BEFORE trusting
-    it for real scoring. This specifically tests the failure mode where
-    output_attentions is passed positionally (not as a kwarg) somewhere
-    inside the model's internal call chain, which would make the pre-hook
-    silently ineffective: we run once with model-level output_attentions
-    explicitly OFF (matching how score_pairs_batched et al. will actually
-    call the model once the hook is trusted) and compare the hook-captured
-    tensor against a reference call with output_attentions explicitly
-    forced True at the top level. If they don't match exactly, the hook is
-    disabled and output_attentions stays True for all layers (safe,
-    unchanged behaviour) for the rest of the run.
-    """
-    global _hook_enabled
-    try:
-        probe = tokenizer(
-            "warmup text a", "warmup text b",
-            return_tensors="pt", padding=True,
-        ).to(DEVICE)
-
-        model.config.output_attentions = False
-        _last_attn_capture["tensor"] = None
-        with torch.no_grad():
-            _ = model(**probe)  # relies purely on the hook forcing the last layer
-            hooked = _last_attn_capture["tensor"]
-            reference = model(**probe, output_attentions=True).attentions[-1]
-
-        if hooked is None or hooked.shape != reference.shape or not torch.allclose(hooked, reference, atol=1e-5):
-            logger.warning(
-                "Last-layer attention hook self-check FAILED (no capture or "
-                "mismatch vs reference) — disabling hook, reverting to "
-                "output_attentions=True for all layers."
-            )
-            _hook_enabled = False
-            model.config.output_attentions = True
-        else:
-            logger.info(
-                "Last-layer attention hook self-check passed — only the "
-                "last layer's attention will be computed/retained from now on."
-            )
-    except Exception as exc:
-        logger.warning(
-            "Attention hook self-check raised %s — disabling hook, "
-            "reverting to output_attentions=True for all layers.", exc,
-        )
-        _hook_enabled = False
-        model.config.output_attentions = True
-
-
-def _forward_get_last_attention(model, inputs):
-    """
-    Runs model(**inputs) and returns (outputs, attentions_last).
-
-    If the last-layer-only hook is active and passed its self-check,
-    attentions_last comes from the hook capture and other layers never
-    retained their attention tensors (cheaper). Otherwise this transparently
-    falls back to outputs.attentions[-1] (original behaviour). Both paths
-    return numerically identical tensors — see _self_check_attention_hook.
-    """
-    outputs = model(**inputs)
-    if _hook_enabled and _last_attn_capture["tensor"] is not None:
-        return outputs, _last_attn_capture["tensor"]
-    return outputs, outputs.attentions[-1]
 
 
 def _autocast_ctx():
@@ -217,16 +63,6 @@ def get_cross_encoder():
         _model.to(DEVICE)
         _model.eval()
         logger.info("Cross-encoder loaded on %s", DEVICE)
-
-        if CACD_USE_LAST_LAYER_ATTENTION_HOOK:
-            if _install_last_layer_attention_hook(_model):
-                _self_check_attention_hook(_model, _tokenizer)
-        else:
-            logger.info(
-                "Last-layer attention hook disabled (CACD_USE_LAST_LAYER_ATTENTION_HOOK=False) "
-                "— using output_attentions=True for all layers."
-            )
-
     return _tokenizer, _model
 
 
@@ -370,7 +206,7 @@ def score_pair(text_a: str, text_b: str) -> dict:
     ).to(DEVICE)
 
     with _autocast_ctx():
-        outputs, attn_last = _forward_get_last_attention(model, inputs)
+        outputs = model(**inputs)
 
     # Handle both binary models (scalar logit) and multi-class models (e.g. NLI 3-class)
     logits = outputs.logits.squeeze()
@@ -384,7 +220,8 @@ def score_pair(text_a: str, text_b: str) -> dict:
 
     # Last attention layer averaged across all heads.
     # The last layer carries the strongest semantic signal for the classification head.
-    last_layer_attn = attn_last[0]                # (num_heads, seq, seq)
+    attentions      = outputs.attentions          # tuple of (1, num_heads, seq, seq)
+    last_layer_attn = attentions[-1][0]           # (num_heads, seq, seq)
     avg_attn        = last_layer_attn.mean(dim=0) # (seq, seq)
 
     input_ids = inputs["input_ids"][0]
@@ -488,9 +325,10 @@ def score_candidates_batched(
 
     outputs = None
     with _autocast_ctx():
-        outputs, attentions_last = _forward_get_last_attention(model, inputs)
+        outputs = model(**inputs)
 
     logits_batch    = outputs.logits          # (batch, num_labels)
+    attentions_last = outputs.attentions[-1]  # (batch, num_heads, seq, seq)
 
     for batch_i, (orig_i, cand) in enumerate(to_score):
         logits = logits_batch[batch_i]
@@ -572,9 +410,10 @@ def score_sentences_batched(candidate_text: str, sentences: list[str]) -> list[d
     ).to(DEVICE)
 
     with _autocast_ctx():
-        outputs, attentions_last = _forward_get_last_attention(model, inputs)
+        outputs = model(**inputs)
 
     logits_batch    = outputs.logits          # (batch, num_labels)
+    attentions_last = outputs.attentions[-1]  # (batch, num_heads, seq, seq)
 
     results = []
     for batch_i in range(len(sentences)):
@@ -611,7 +450,7 @@ def score_sentences_batched(candidate_text: str, sentences: list[str]) -> list[d
 @torch.no_grad()
 def score_pairs_batched(
     pairs: list[tuple[str, str]],
-    sub_batch_size: int = CACD_SUB_BATCH_SIZE,
+    sub_batch_size: int = 128,
 ) -> list[dict]:
     """
     Fully general batched scoring: unlike score_candidates_batched (one A,
@@ -660,55 +499,28 @@ def score_pairs_batched(
         ).to(DEVICE)
 
         with _autocast_ctx():
-            outputs, attentions_last = _forward_get_last_attention(model, inputs)
+            outputs = model(**inputs)
 
-        logits_batch = outputs.logits
-
-        # ── Vectorized batch-level computation (4 GPU syncs total for the
-        # whole sub-batch, instead of ~4 per item = up to 4*sub_batch_size).
-        # Each .item()/.tolist() call forces a GPU-CPU synchronization point;
-        # doing this once per TENSOR (not once per PAIR) is what actually
-        # lets a larger sub_batch_size translate into a real speedup instead
-        # of just moving the same number of syncs into fewer Python loops.
-        if logits_batch.dim() == 1 or logits_batch.shape[-1] == 1:
-            # Binary/regression head: one logit per pair.
-            flat_logits    = logits_batch.reshape(-1)
-            prob_dup_batch = torch.sigmoid(flat_logits)
-            raw_logit_batch = flat_logits
-        else:
-            # Multi-class head (e.g. 3-class NLI): use the last class as "duplicate".
-            prob_dup_batch  = torch.softmax(logits_batch, dim=-1)[:, -1]
-            raw_logit_batch = logits_batch[:, -1]
-
-        n_tokens_batch = inputs["attention_mask"].sum(dim=1)  # (sub_batch,)
-
-        sep_id      = tokenizer.sep_token_id
-        input_ids   = inputs["input_ids"]                      # (sub_batch, seq)
-        is_sep      = (input_ids == sep_id)
-        has_sep     = is_sep.any(dim=1)
-        # argmax on a bool-as-float tensor returns the index of the FIRST
-        # True (the first [SEP]) when at least one exists.
-        first_sep_idx = is_sep.float().argmax(dim=1)
-        fallback_idx  = n_tokens_batch // 2
-        sep_idx_batch = torch.where(has_sep, first_sep_idx, fallback_idx)
-
-        # Single conversion to Python values for the whole sub-batch.
-        prob_dup_list  = prob_dup_batch.detach().cpu().tolist()
-        raw_logit_list = raw_logit_batch.detach().cpu().tolist()
-        n_tokens_list  = n_tokens_batch.detach().cpu().tolist()
-        sep_idx_list   = sep_idx_batch.detach().cpu().tolist()
+        logits_batch    = outputs.logits
+        attentions_last  = outputs.attentions[-1]
 
         for batch_i in range(len(sub)):
-            prob_dup  = float(prob_dup_list[batch_i])
-            raw_logit = raw_logit_list[batch_i]
-            n_tokens  = int(n_tokens_list[batch_i])
-            sep_idx   = int(sep_idx_list[batch_i])
+            logits = logits_batch[batch_i]
+            if logits.dim() == 0 or logits.shape[0] == 1:
+                prob_dup  = float(torch.sigmoid(logits.squeeze()).item())
+                raw_logit = logits.squeeze().item()
+            else:
+                prob_dup  = float(torch.softmax(logits, dim=-1)[-1].item())
+                raw_logit = logits[-1].item()
 
             avg_attn = attentions_last[batch_i].mean(dim=0)
 
-            # Unchanged from before: same function, same per-item slicing,
-            # same numeric behaviour — only n_tokens/sep_idx are now plain
-            # Python ints computed above instead of re-derived here.
+            input_ids = inputs["input_ids"][batch_i]
+            n_tokens  = int(inputs["attention_mask"][batch_i].sum().item())
+            sep_id    = tokenizer.sep_token_id
+            sep_pos   = (input_ids == sep_id).nonzero(as_tuple=True)[0]
+            sep_idx   = int(sep_pos[0].item()) if len(sep_pos) > 0 else n_tokens // 2
+
             cov_a2b, cov_b2a = _max_alignment_coverage(avg_attn, sep_idx, n_tokens)
             nis = _novel_information_score(avg_attn, sep_idx, n_tokens)
 
