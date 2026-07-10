@@ -72,7 +72,7 @@ CACD_INGEST_BATCH_SIZE = 128
 # watch VRAM when increasing) to let more chunks' pairs land in one real
 # forward pass. 512 is a starting point for a modern GPU with short
 # (<=256-token) inputs; lower it if you hit out-of-memory errors.
-CACD_SUB_BATCH_SIZE = 512
+CACD_SUB_BATCH_SIZE = 128
 
 CACD_TOP_K_CANDIDATES = 5   # top-K nearest neighbours retrieved from HNSW per chunk
 
