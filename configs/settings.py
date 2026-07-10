@@ -62,6 +62,18 @@ EMBED_BATCH_SIZE = 512 if torch.cuda.is_available() else 128
 # exactly.
 CACD_INGEST_BATCH_SIZE = 128
 
+# Number of (text_a, text_b) pairs sent to the cross-encoder in a single
+# forward pass inside score_pairs_batched, regardless of how many chunks
+# CACD_INGEST_BATCH_SIZE groups together. If one micro-batch of chunks
+# produces MORE pairs than this, score_pairs_batched splits them into
+# several forward passes automatically — so if this is set too low, it
+# silently caps how much CACD_INGEST_BATCH_SIZE can help. Raise this as far
+# as GPU memory allows (attention tensors are O(batch x heads x seq^2), so
+# watch VRAM when increasing) to let more chunks' pairs land in one real
+# forward pass. 512 is a starting point for a modern GPU with short
+# (<=256-token) inputs; lower it if you hit out-of-memory errors.
+CACD_SUB_BATCH_SIZE = 512
+
 CACD_TOP_K_CANDIDATES = 5   # top-K nearest neighbours retrieved from HNSW per chunk
 
 # Micro-batch size for Stage 1 + Stage 2: instead of processing chunks one
@@ -90,21 +102,20 @@ CACD_MICROBATCH_SIZE = 32
 CACD_USE_FP16 = True
 
 # ── CACD — Stage 2 (Cross-attention) ─────────────────────────────────────────
-# Original (paper-selected): cross-encoder/msmarco-MiniLM-L6-en-de-v1, chosen
-# after a 37-model comparison experiment; multilingual EN-DE MiniLM-L6.
+# Paper-selected model: cross-encoder/msmarco-MiniLM-L6-en-de-v1, chosen after
+# a 37-model comparison experiment; multilingual EN-DE MiniLM-L6.
 #
-# SPEED EXPERIMENT (current): swapped to cross-encoder/ms-marco-MiniLM-L4-v2.
-# WARNING — this is a DIFFERENT model family, not a smaller version of the
-# model above: the en-de-v1 family only ships L6/L12, no L4/L2 sibling. The
-# ms-marco-MiniLM-L-*-v2 family is the same MiniLM architecture but trained
-# on English-only MS MARCO data (not cross-lingual EN-DE). For a pure-English
-# benchmark (SQuAD 1.1) this is plausibly fine or even better-suited, but it
-# is a genuine model swap — re-run the 5-pair Model Selection sanity check
-# (experiment_model_comparison.py) AND CACD's own Precision/Recall/IoU before
-# trusting full-dataset results with this model. To revert to the
-# paper-selected model, restore the line below.
-CACD_CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L4-v2"
-# CACD_CROSS_ENCODER_MODEL = "cross-encoder/msmarco-MiniLM-L6-en-de-v1"  # paper-selected — restore to revert
+# SPEED EXPERIMENT (abandoned): tried cross-encoder/ms-marco-MiniLM-L4-v2 as a
+# faster stand-in. Reverted for two reasons: (1) it is a different model
+# family (English-only MS MARCO training, not cross-lingual EN-DE — the
+# en-de-v1 family has no L4/L2 sibling to begin with), so its attention maps
+# are not directly comparable to what the NIS/heatmaps were designed around;
+# (2) PROB_HIGH/PROB_LOW/NIS_DROP_THRESHOLD were calibrated for L6's score
+# distribution and did not transfer — drop rate collapsed to ~0.16% on the
+# full run (CACD behaving almost like NoFilter), and recalibrating would not
+# have fixed the deeper issue of the attention maps themselves being off.
+# Back to L6; CACD_INGEST_BATCH_SIZE (below) remains the active speed lever.
+CACD_CROSS_ENCODER_MODEL = "cross-encoder/msmarco-MiniLM-L6-en-de-v1"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
