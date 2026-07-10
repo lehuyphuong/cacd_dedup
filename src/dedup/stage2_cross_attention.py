@@ -29,7 +29,13 @@ import numpy as np
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-from configs.settings import CACD_CROSS_ENCODER_MODEL, CACD_SUB_BATCH_SIZE, CACD_USE_FP16, DEVICE
+from configs.settings import (
+    CACD_CROSS_ENCODER_MODEL,
+    CACD_SUB_BATCH_SIZE,
+    CACD_USE_FP16,
+    CACD_USE_LAST_LAYER_ATTENTION_HOOK,
+    DEVICE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -212,8 +218,14 @@ def get_cross_encoder():
         _model.eval()
         logger.info("Cross-encoder loaded on %s", DEVICE)
 
-        if _install_last_layer_attention_hook(_model):
-            _self_check_attention_hook(_model, _tokenizer)
+        if CACD_USE_LAST_LAYER_ATTENTION_HOOK:
+            if _install_last_layer_attention_hook(_model):
+                _self_check_attention_hook(_model, _tokenizer)
+        else:
+            logger.info(
+                "Last-layer attention hook disabled (CACD_USE_LAST_LAYER_ATTENTION_HOOK=False) "
+                "— using output_attentions=True for all layers."
+            )
 
     return _tokenizer, _model
 

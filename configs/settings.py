@@ -72,6 +72,33 @@ CACD_INGEST_BATCH_SIZE = 128
 # watch VRAM when increasing) to let more chunks' pairs land in one real
 # forward pass. 512 is a starting point for a modern GPU with short
 # (<=256-token) inputs; lower it if you hit out-of-memory errors.
+# Whether to use the "only compute the last layer's attention" hook
+# optimization (see stage2_cross_attention.py). DEFAULT: DISABLED.
+#
+# Empirically REGRESSED performance rather than improving it: on a direct
+# GPU comparison (FixedSize_200/400), batch=128 WITH this hook measured
+# 200.5s / 85.2s, versus 102.2s / 46.8s for batch=128 WITHOUT it (and
+# 110.0s / 55.6s at batch=32 without it) — i.e. enabling the hook made
+# ingestion ~2x slower, not faster.
+#
+# Root cause: get_cross_encoder() loads the model with output_attentions=True
+# in from_pretrained(...) itself, which forces the WHOLE model onto the
+# slower "eager" attention implementation at LOAD time (a structural,
+# per-layer class choice), not a per-call runtime toggle. Setting
+# model.config.output_attentions=False afterward does not retroactively
+# swap any layer back to a faster fused kernel (SDPA/FlashAttention) —
+# every layer is already the same "eager" module either way, and attention
+# probabilities are computed as an unavoidable byproduct of every forward
+# pass regardless of output_attentions (that flag only controls whether the
+# tensor is additionally RETAINED in the output tuple). So the hook's
+# premise — that non-last layers could become cheaper — does not hold given
+# how this model is loaded, and the hook's own Python-level indirection
+# (pre-hook + post-hook on every call) was pure added overhead with no
+# offsetting saving. Left here (off) rather than deleted in case a future
+# loading strategy (e.g. a model loaded WITHOUT output_attentions=True,
+# with attention only forced on selectively) makes the premise valid again.
+CACD_USE_LAST_LAYER_ATTENTION_HOOK = False
+
 CACD_SUB_BATCH_SIZE = 128
 
 CACD_TOP_K_CANDIDATES = 5   # top-K nearest neighbours retrieved from HNSW per chunk
