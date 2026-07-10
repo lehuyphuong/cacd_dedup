@@ -662,25 +662,53 @@ def score_pairs_batched(
         with _autocast_ctx():
             outputs, attentions_last = _forward_get_last_attention(model, inputs)
 
-        logits_batch    = outputs.logits
+        logits_batch = outputs.logits
+
+        # ── Vectorized batch-level computation (4 GPU syncs total for the
+        # whole sub-batch, instead of ~4 per item = up to 4*sub_batch_size).
+        # Each .item()/.tolist() call forces a GPU-CPU synchronization point;
+        # doing this once per TENSOR (not once per PAIR) is what actually
+        # lets a larger sub_batch_size translate into a real speedup instead
+        # of just moving the same number of syncs into fewer Python loops.
+        if logits_batch.dim() == 1 or logits_batch.shape[-1] == 1:
+            # Binary/regression head: one logit per pair.
+            flat_logits    = logits_batch.reshape(-1)
+            prob_dup_batch = torch.sigmoid(flat_logits)
+            raw_logit_batch = flat_logits
+        else:
+            # Multi-class head (e.g. 3-class NLI): use the last class as "duplicate".
+            prob_dup_batch  = torch.softmax(logits_batch, dim=-1)[:, -1]
+            raw_logit_batch = logits_batch[:, -1]
+
+        n_tokens_batch = inputs["attention_mask"].sum(dim=1)  # (sub_batch,)
+
+        sep_id      = tokenizer.sep_token_id
+        input_ids   = inputs["input_ids"]                      # (sub_batch, seq)
+        is_sep      = (input_ids == sep_id)
+        has_sep     = is_sep.any(dim=1)
+        # argmax on a bool-as-float tensor returns the index of the FIRST
+        # True (the first [SEP]) when at least one exists.
+        first_sep_idx = is_sep.float().argmax(dim=1)
+        fallback_idx  = n_tokens_batch // 2
+        sep_idx_batch = torch.where(has_sep, first_sep_idx, fallback_idx)
+
+        # Single conversion to Python values for the whole sub-batch.
+        prob_dup_list  = prob_dup_batch.detach().cpu().tolist()
+        raw_logit_list = raw_logit_batch.detach().cpu().tolist()
+        n_tokens_list  = n_tokens_batch.detach().cpu().tolist()
+        sep_idx_list   = sep_idx_batch.detach().cpu().tolist()
 
         for batch_i in range(len(sub)):
-            logits = logits_batch[batch_i]
-            if logits.dim() == 0 or logits.shape[0] == 1:
-                prob_dup  = float(torch.sigmoid(logits.squeeze()).item())
-                raw_logit = logits.squeeze().item()
-            else:
-                prob_dup  = float(torch.softmax(logits, dim=-1)[-1].item())
-                raw_logit = logits[-1].item()
+            prob_dup  = float(prob_dup_list[batch_i])
+            raw_logit = raw_logit_list[batch_i]
+            n_tokens  = int(n_tokens_list[batch_i])
+            sep_idx   = int(sep_idx_list[batch_i])
 
             avg_attn = attentions_last[batch_i].mean(dim=0)
 
-            input_ids = inputs["input_ids"][batch_i]
-            n_tokens  = int(inputs["attention_mask"][batch_i].sum().item())
-            sep_id    = tokenizer.sep_token_id
-            sep_pos   = (input_ids == sep_id).nonzero(as_tuple=True)[0]
-            sep_idx   = int(sep_pos[0].item()) if len(sep_pos) > 0 else n_tokens // 2
-
+            # Unchanged from before: same function, same per-item slicing,
+            # same numeric behaviour — only n_tokens/sep_idx are now plain
+            # Python ints computed above instead of re-derived here.
             cov_a2b, cov_b2a = _max_alignment_coverage(avg_attn, sep_idx, n_tokens)
             nis = _novel_information_score(avg_attn, sep_idx, n_tokens)
 
