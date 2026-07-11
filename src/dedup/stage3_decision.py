@@ -744,10 +744,31 @@ def run_cacd_dedup(
 
     # ── ONE bulk upsert into Qdrant for the whole config, purely so the
     # final kept set is available for the downstream RAG retrieval
-    # evaluation step -- Qdrant played no role in any decision above ──
+    # evaluation step -- Qdrant played no role in any decision above.
+    #
+    # upsert_chunks() internally re-splits into sub-batches of `batch_size`
+    # (default 256), each its own separate client.upsert(..., wait=True)
+    # round trip to Qdrant's storage backend -- fine when it was called
+    # once per 32-chunk micro-batch, but now that this is the ONLY upsert
+    # call for the whole config, the default would silently turn "one
+    # upsert" back into ~len(all_upsert_chunks)/256 round trips (e.g. ~33
+    # calls for 8213 points), reintroducing the same per-call-overhead
+    # pattern Stage 1 was just fixed for for one specific measured case:
+    # 23.1s / 33 calls =~ 0.7s per call, in line with the round-trip costs
+    # measured earlier in this conversation. A single large batch cuts
+    # that down to as few calls as possible ──
     if all_upsert_chunks:
         _t0 = _time.perf_counter()
-        upsert_chunks(cname, all_upsert_chunks, all_upsert_vecs)
+        upsert_chunks(
+            cname, all_upsert_chunks, all_upsert_vecs,
+            # Capped rather than fully unbounded: safe for embedded/local
+            # mode either way, but also keeps this reasonable if cname's
+            # backend is later switched to a real Qdrant server
+            # (QDRANT_URL), where a single gRPC/REST request has practical
+            # size limits. 5000 cuts an ~11K-chunk config from ~43 default
+            # round trips down to 2-3.
+            batch_size=min(len(all_upsert_chunks), 5000),
+        )
         _t_final_upsert = _time.perf_counter() - _t0
 
     logger.info(
