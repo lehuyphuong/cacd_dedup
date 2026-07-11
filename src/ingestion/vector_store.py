@@ -35,6 +35,7 @@ from qdrant_client.models import (
 from configs.settings import (
     COLLECTION_PREFIX,
     QDRANT_PATH,
+    QDRANT_URL,
     TEXT_EMBED_DIM,
 )
 
@@ -46,8 +47,17 @@ _client: QdrantClient | None = None
 def get_client() -> QdrantClient:
     global _client
     if _client is None:
-        logger.info("Opening Qdrant embedded store at: %s", QDRANT_PATH)
-        _client = QdrantClient(path=str(QDRANT_PATH))
+        if QDRANT_URL:
+            logger.info("Connecting to Qdrant server at: %s", QDRANT_URL)
+            _client = QdrantClient(url=QDRANT_URL)
+        else:
+            logger.info(
+                "Opening Qdrant embedded store at: %s "
+                "(local/brute-force mode -- set configs.settings.QDRANT_URL "
+                "to use a real server instead; see comment there)",
+                QDRANT_PATH,
+            )
+            _client = QdrantClient(path=str(QDRANT_PATH))
     return _client
 
 

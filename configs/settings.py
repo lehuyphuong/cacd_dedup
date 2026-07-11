@@ -34,6 +34,30 @@ RESULTS_DIR.mkdir(exist_ok=True)
 QDRANT_PATH.mkdir(exist_ok=True)
 HEATMAP_DIR.mkdir(exist_ok=True)
 
+# QDRANT_URL: if set (e.g. "http://localhost:6333"), vector_store.get_client()
+# connects to a REAL Qdrant server instead of embedded/local mode.
+#
+# Why this matters: QdrantClient(path=...) ("Local Mode") is documented by
+# qdrant-client itself as brute-force only -- it never builds an HNSW graph,
+# regardless of hnsw_config / optimizers_config.indexing_threshold (those are
+# server-only knobs the local backend does not implement) -- and persists
+# through a SQLite-backed store on disk, not a plain in-memory numpy array.
+# Local Mode is documented as intended "for development, testing, demos, and
+# small-scale datasets (up to ~20,000 points)", not for the repeated
+# incremental upsert+query cycle CACD's ingest loop does (282+ small upserts
+# interleaved with as many batched queries per config). Measured on this
+# project: per-chunk Stage 1 retrieval cost grew from ~6ms to ~60ms over a
+# single 9022-chunk run as the collection grew -- a roughly linear/O(n)
+# pattern consistent with a disk-backed brute-force scan, not the O(log n)
+# HNSW behaviour CACD's Big-O analysis (Section III-B) assumes. Switching to
+# a real server (`docker run -p 6333:6333 -p 6334:6334 -v qdrant_storage:/qdrant/storage qdrant/qdrant`)
+# gives the genuine Rust HNSW engine this project was designed around.
+#
+# Leave as None to keep using embedded/local mode (path-based, single-process
+# only, brute-force) -- e.g. for quick experiments where you don't want to
+# run Docker. Set to a URL to use a real server.
+QDRANT_URL = None   # e.g. "http://localhost:6333"
+
 # ── Dataset ───────────────────────────────────────────────────────────────────
 DATASET_NAME       = "rajpurkar/squad"
 DATASET_SPLIT      = "validation"
