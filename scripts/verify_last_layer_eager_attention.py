@@ -34,12 +34,36 @@ Run:  python scripts/verify_last_layer_eager_attention.py
 from __future__ import annotations
 
 import copy
+import os
 import sys
 import time
 from pathlib import Path
 
+# Set BEFORE importing torch: on some cloud/container CPUs, torch's default
+# OpenMP/MKL thread pool oversubscribes relative to the cgroup's actual CPU
+# quota, which can make even tiny models pathologically slow (minutes for
+# what should be milliseconds) rather than genuinely hang. Pinning to 1
+# thread here removes that variable so a real hang vs. "just very slow"
+# can be told apart. This only affects this diagnostic script, not the
+# production pipeline.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+# Force line-buffered stdout: when this script's output is piped, redirected
+# to a file, or captured by a log wrapper (nohup, docker logs, etc.) instead
+# of a real terminal, Python defaults to block-buffering, which can make a
+# script that's actually running fine LOOK stuck for a long time because
+# nothing gets written until the buffer fills or the process exits. This
+# makes every print() show up immediately instead.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except AttributeError:
+    pass  # Python < 3.7 fallback: not expected in this project, ignore.
+
 import torch
 from transformers import BertConfig, BertForSequenceClassification
+
+torch.set_num_threads(1)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -230,25 +254,30 @@ def check_correctness_and_speed():
           f"(threshold 1e-4)")
 
     print("\n[3] Relative speed check (CPU, tiny model -- direction only, "
-          "not representative of real GPU timing)")
+          "not representative of real GPU timing)", flush=True)
     n_repeats = 200
+    heartbeat_every = 50
     with torch.no_grad():
         t0 = time.perf_counter()
-        for _ in range(n_repeats):
+        for i in range(n_repeats):
             reference(**batch, output_attentions=True)
+            if (i + 1) % heartbeat_every == 0:
+                print(f"    reference pass {i + 1}/{n_repeats}...", flush=True)
         t_reference = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        for _ in range(n_repeats):
+        for i in range(n_repeats):
             patched(**batch)
             s2._captured_attn["weights"] = None
+            if (i + 1) % heartbeat_every == 0:
+                print(f"    patched pass {i + 1}/{n_repeats}...", flush=True)
         t_patched = time.perf_counter() - t0
 
-    print(f"  reference (global eager):     {t_reference:.3f}s / {n_repeats} passes")
-    print(f"  patched (last-layer eager):   {t_patched:.3f}s / {n_repeats} passes")
+    print(f"  reference (global eager):     {t_reference:.3f}s / {n_repeats} passes", flush=True)
+    print(f"  patched (last-layer eager):   {t_patched:.3f}s / {n_repeats} passes", flush=True)
     print(f"  ratio (patched/reference):    {t_patched / t_reference:.2f}x "
           "(expect < 1.0; gap will be far larger on the real 6-layer model "
-          "under GPU FP16 batching, where eager's relative cost is higher)")
+          "under GPU FP16 batching, where eager's relative cost is higher)", flush=True)
 
     return isolated_ok and attn_ok and logits_ok
 
