@@ -436,12 +436,26 @@ def run_cacd_dedup(
         (kept_chunks, audit_log)
     """
     from src.ingestion.vector_store import upsert_chunks
+    import time as _time
 
     if micro_batch_size is None:
         micro_batch_size = CACD_INGEST_BATCH_SIZE
 
     kept_chunks: list[dict] = []
     audit_log:   list[dict] = []
+
+    # ── Diagnostic timing (added to root-cause an unexplained ingest-time
+    # regression -- see conversation). Cumulative wall-clock time spent in
+    # each stage across the whole ingest run, printed at the end. This is
+    # deliberately coarse (perf_counter around each stage's code block, not
+    # per-chunk) so it adds negligible overhead of its own and can be left
+    # on without skewing the very numbers it's trying to measure.
+    _t_stage1  = 0.0   # Stage 1: batch_coarse_retrieve (Qdrant query)
+    _t_stage2  = 0.0   # Stage 2: score_pairs_batched (cross-encoder forward passes)
+    _t_stage3  = 0.0   # Stage 3: per-chunk voting (should be ~free, CPU only)
+    _t_upsert  = 0.0   # Qdrant upsert_chunks at the end of each micro-batch
+    _t_other   = 0.0   # guard filtering / bookkeeping between stages
+    _cross_encoder_load_logged = False
 
     def _vote_decision(chunk: dict, valid_scored: list[dict]):
         """
@@ -518,9 +532,11 @@ def run_cacd_dedup(
         batch_vecs   = dense_vecs[batch_start:batch_end]
 
         # ── Stage 1 (whole batch, one index snapshot) ───────────────────
+        _t0 = _time.perf_counter()
         candidates_list, _ = batch_coarse_retrieve(
             batch_chunks, batch_vecs, cname, top_k=None,
         )
+        _t_stage1 += _time.perf_counter() - _t0
         if not candidates_list:
             candidates_list = [[] for _ in batch_chunks]
 
@@ -533,6 +549,7 @@ def run_cacd_dedup(
         flat_owner:      list[int] = []         # index into batch_chunks
         flat_cand:       list[dict] = []
 
+        _t0 = _time.perf_counter()
         for bi, chunk in enumerate(batch_chunks):
             cands = candidates_list[bi] if bi < len(candidates_list) else []
             if not cands:
@@ -562,9 +579,20 @@ def run_cacd_dedup(
                 flat_owner.append(bi)
                 flat_cand.append(cand)
 
-        # ── Stage 2 (whole batch, as few forward passes as possible) ────
-        flat_results = score_pairs_batched(flat_pairs) if flat_pairs else []
+        _t_other += _time.perf_counter() - _t0
 
+        # ── Stage 2 (whole batch, as few forward passes as possible) ────
+        # NOTE: on the very FIRST micro-batch of the whole run, this also
+        # includes lazy model loading (get_cross_encoder()) + the
+        # last-layer-eager self-test forward pass -- a one-time cost, not
+        # representative of steady-state per-batch Stage 2 time. Compare
+        # _t_stage2 across the printed per-N-chunks progress lines if you
+        # want to isolate that one-time cost from the recurring cost.
+        _t0 = _time.perf_counter()
+        flat_results = score_pairs_batched(flat_pairs) if flat_pairs else []
+        _t_stage2 += _time.perf_counter() - _t0
+
+        _t0 = _time.perf_counter()
         scored_per_chunk: list[list[dict]] = [[] for _ in batch_chunks]
         for owner_bi, cand, result in zip(flat_owner, flat_cand, flat_results):
             merged = dict(cand)
@@ -573,6 +601,7 @@ def run_cacd_dedup(
                 result["coverage_a_to_b"], result["coverage_b_to_a"]
             )
             scored_per_chunk[owner_bi].append(merged)
+        _t_other += _time.perf_counter() - _t0
 
         # ── Stage 3 (per chunk, same rule as always) + collect upserts ──
         to_upsert_chunks: list[dict] = []
@@ -617,7 +646,9 @@ def run_cacd_dedup(
                 continue
 
             valid_scored = scored_per_chunk[bi]
+            _t0 = _time.perf_counter()
             decision, reason, best = _vote_decision(chunk, valid_scored)
+            _t_stage3 += _time.perf_counter() - _t0
 
             audit_log.append({
                 "chunk_id":           chunk["chunk_id"],
@@ -675,7 +706,9 @@ def run_cacd_dedup(
 
         # ── One batched upsert for everything kept/merged in this batch ──
         if to_upsert_chunks:
+            _t0 = _time.perf_counter()
             upsert_chunks(cname, to_upsert_chunks, to_upsert_vecs)
+            _t_upsert += _time.perf_counter() - _t0
 
     logger.info(
         "  CACD done: %d => %d chunks kept "
@@ -683,4 +716,38 @@ def run_cacd_dedup(
         len(chunks), len(kept_chunks),
         PROB_LOW, PROB_HIGH, NIS_DROP_THRESHOLD, micro_batch_size,
     )
+
+    _t_total = _t_stage1 + _t_stage2 + _t_stage3 + _t_upsert + _t_other
+    from configs.settings import DEVICE as _device
+    try:
+        import torch as _torch
+        _cuda_ok = _torch.cuda.is_available()
+        _gpu_name = _torch.cuda.get_device_name(0) if _cuda_ok else "N/A"
+    except Exception:
+        _cuda_ok, _gpu_name = None, "unknown"
+    logger.info(
+        "  CACD timing breakdown (%.1fs total): "
+        "Stage1(retrieval)=%.1fs (%.0f%%) | "
+        "Stage2(cross-encoder)=%.1fs (%.0f%%) | "
+        "Stage3(voting)=%.1fs (%.0f%%) | "
+        "upsert=%.1fs (%.0f%%) | other=%.1fs (%.0f%%)",
+        _t_total,
+        _t_stage1, 100 * _t_stage1 / max(_t_total, 1e-9),
+        _t_stage2, 100 * _t_stage2 / max(_t_total, 1e-9),
+        _t_stage3, 100 * _t_stage3 / max(_t_total, 1e-9),
+        _t_upsert, 100 * _t_upsert / max(_t_total, 1e-9),
+        _t_other,  100 * _t_other  / max(_t_total, 1e-9),
+    )
+    logger.info(
+        "  Device check: configs.settings.DEVICE=%s | "
+        "torch.cuda.is_available()=%s | GPU=%s",
+        _device, _cuda_ok, _gpu_name,
+    )
+    if _device == "cpu" or _cuda_ok is False:
+        logger.warning(
+            "  *** Running on CPU, not GPU -- this alone can be 10-50x "
+            "slower than the GPU baseline and is the most likely explanation "
+            "for an ingest time far above the ~88s/config baseline. ***"
+        )
+
     return kept_chunks, audit_log
