@@ -97,6 +97,40 @@ CACD_CROSS_ENCODER_MODEL = "cross-encoder/msmarco-MiniLM-L6-en-de-v1"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Speed idea #1 from the Stage-2 research pass (see CACD_context_handoff.md,
+# "Ý tưởng chủ lực"): request eager (attention-materialising) computation
+# ONLY on the final transformer layer, instead of forcing the whole 6-layer
+# stack into eager mode via a global `output_attentions=True` at
+# from_pretrained() time (that global approach is Bug #8 in the project
+# history — it was ~2x slower, 200s vs 102s, because ALL layers paid the
+# eager tax even though NIS only ever reads the LAST layer's attention).
+#
+# Mechanism (see get_cross_encoder() / _enable_last_layer_only_eager() in
+# stage2_cross_attention.py for the full explanation):
+#   - Model is loaded with attn_implementation="sdpa" (fast) for every layer.
+#   - Only the last layer's self-attention submodule gets a PRIVATE COPY of
+#     the model config with _attn_implementation="eager", so it alone
+#     computes real attention weights via eager_attention_forward while all
+#     other layers stay on the fast SDPA path.
+#   - A forward hook on that one submodule captures its returned attention
+#     weights directly, independent of whether wrapping modules (BertLayer)
+#     propagate them further.
+#   - This is DIFFERENT from the previously-tried and abandoned
+#     CACD_USE_LAST_LAYER_ATTENTION_HOOK approach (Bug #8): that one still
+#     requested output_attentions=True globally at load time, which locks
+#     the whole model into eager regardless of any post-hoc config edits.
+#     This version never requests it globally at all.
+#
+# At startup, get_cross_encoder() runs a tiny 2-token self-test forward pass
+# to confirm the hook actually captures a real (non-None, correctly-shaped)
+# attention tensor. If that check fails for any reason (unexpected model
+# architecture, incompatible transformers version, shared-config aliasing
+# that could not be avoided, etc.), it logs a warning and automatically
+# falls back to the old, slower-but-known-good global eager loading path —
+# so this flag should be safe to leave on, but keep it here as an explicit
+# kill switch for A/B benchmarking or if something looks wrong.
+CACD_USE_LAST_LAYER_EAGER_ATTENTION = True
+
 # ── CACD — Stage 3 (Decision: Bayes-optimal cutoff) ──────────────────────────
 # cutoff = cost_FP / (cost_FP + cost_FN)
 #   cost_FP: cost of incorrectly dropping a non-duplicate chunk (information loss)

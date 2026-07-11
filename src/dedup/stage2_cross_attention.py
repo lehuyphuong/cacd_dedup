@@ -23,18 +23,40 @@ Public API:
 from __future__ import annotations
 
 import contextlib
+import copy
 import logging
 
 import numpy as np
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-from configs.settings import CACD_CROSS_ENCODER_MODEL, CACD_USE_FP16, DEVICE
+from configs.settings import (
+    CACD_CROSS_ENCODER_MODEL,
+    CACD_USE_FP16,
+    CACD_USE_LAST_LAYER_EAGER_ATTENTION,
+    DEVICE,
+)
 
 logger = logging.getLogger(__name__)
 
 _tokenizer = None
 _model     = None
+
+# True once get_cross_encoder() has confirmed the last-layer-only-eager patch
+# is active and self-tested successfully; False means we're on the old,
+# slower global-eager fallback (either by choice via the settings flag, or
+# because the self-test failed). Read by the scoring functions to decide
+# whether to pull attention from the capture box below or from
+# outputs.attentions[-1] as before.
+_last_layer_capture_active = False
+
+# Mutable "box" the forward hook writes into. A plain dict (not a variable)
+# so the hook closure can mutate it without needing `nonlocal`/`global`.
+# Forward passes in this codebase are always run sequentially to completion
+# before the next one starts (no overlapping/async forward calls), so a
+# single shared slot -- overwritten and read back within the same call --
+# is safe; it is not meant to survive across calls.
+_captured_attn: dict = {"weights": None}
 
 
 def _autocast_ctx():
@@ -50,20 +72,215 @@ def _autocast_ctx():
     return contextlib.nullcontext()
 
 
+def _find_last_self_attention_module(model):
+    """
+    Locate the final transformer layer's self-attention submodule (e.g.
+    model.bert.encoder.layer[-1].attention.self for a BERT-family
+    sequence-classification model), the way HuggingFace assembles them for
+    AutoModelForSequenceClassification checkpoints such as our cross-encoder.
+
+    Returns the submodule, or None if the model doesn't match the expected
+    BERT-style structure (caller must treat None as "patch not applicable"
+    and fall back to the old global-eager path rather than crashing —
+    other cross-encoder architectures use different attribute names and
+    are simply out of scope for this optimisation).
+    """
+    try:
+        base = getattr(model, model.base_model_prefix)
+        last_layer = base.encoder.layer[-1]
+        return last_layer.attention.self
+    except (AttributeError, IndexError, TypeError):
+        return None
+
+
+def _enable_last_layer_only_eager(model) -> bool:
+    """
+    Make ONLY the final transformer layer compute (and expose) real
+    attention weights, while every other layer keeps running the fast
+    default attention path (SDPA) the model was loaded with.
+
+    Why this differs from the old (Bug #8) approach:
+        Passing `output_attentions=True` to `from_pretrained()` or to a
+        `model(**inputs, output_attentions=True)` call flows the SAME flag
+        down to EVERY layer uniformly, so every layer pays the eager cost.
+        NIS only ever reads the last layer's attention (Section III-C of
+        the paper / `outputs.attentions[-1]` everywhere in this file), so
+        five of those six eager computations were pure waste.
+
+    How it works:
+        1. Give the last layer's self-attention submodule its OWN private
+           copy of the model config (`copy.copy`, not a reference) with
+           `_attn_implementation` forced to "eager". This is important:
+           HuggingFace passes the SAME config object by reference into
+           every layer at construction time, so mutating the shared
+           config's `_attn_implementation` in place would silently force
+           the ENTIRE model into eager again -- copying first avoids that.
+        2. Register a forward hook directly on that one submodule. A hook
+           captures the module's own return value at the point it is
+           produced, so it works whether or not a wrapping module
+           (e.g. BertLayer) actually propagates the attention weights any
+           further up the call stack -- which varies across
+           `transformers` versions and is not something we want this
+           patch to depend on.
+
+    Returns True if the patch was applied (module found, hook registered);
+    False if this model's architecture didn't match what we expected, in
+    which case the caller keeps using the old global-eager loading path.
+    """
+    self_attn = _find_last_self_attention_module(model)
+    if self_attn is None:
+        logger.warning(
+            "Last-layer-eager patch: could not locate a BERT-style "
+            "encoder.layer[-1].attention.self submodule on %s; "
+            "falling back to global eager loading.",
+            type(model).__name__,
+        )
+        return False
+
+    # Step 1: private config copy, eager only for this submodule.
+    private_config = copy.copy(self_attn.config)
+    private_config._attn_implementation = "eager"
+    self_attn.config = private_config
+
+    # Step 2: capture hook. `output` is whatever this submodule's forward
+    # returns -- across transformers versions this has always been a tuple
+    # whose second element is the attention-probability tensor when eager
+    # computation actually ran (2-tuple in current transformers; older
+    # versions return a 1-tuple when output_attentions was False and a
+    # 2-tuple when True -- checking length + None-ness covers both).
+    def _capture_hook(_module, _args, output):
+        if isinstance(output, tuple) and len(output) >= 2 and output[1] is not None:
+            _captured_attn["weights"] = output[1]
+
+    self_attn.register_forward_hook(_capture_hook)
+    return True
+
+
+def _self_test_last_layer_capture(tokenizer, model) -> bool:
+    """
+    Run one tiny forward pass (two short strings) to confirm the capture
+    hook actually produces a real, correctly-shaped attention tensor before
+    trusting it for the whole benchmark run. This mirrors the project's
+    existing practice of verifying a speed change leaves outputs correct
+    (see CACD_context_handoff.md, section 6/9) before relying on it.
+
+    Returns True if a non-None tensor of shape
+    (batch, num_heads, seq_len, seq_len) was captured; False otherwise.
+    """
+    _captured_attn["weights"] = None
+    probe = tokenizer(
+        "self test", "probe pair",
+        return_tensors="pt", truncation=True, max_length=16, padding=True,
+    ).to(DEVICE)
+    with torch.no_grad():
+        model(**probe)
+
+    weights = _captured_attn["weights"]
+    _captured_attn["weights"] = None  # reset so it doesn't leak into real scoring
+
+    if weights is None:
+        logger.warning("Last-layer-eager self-test: no attention weights captured.")
+        return False
+    if weights.dim() != 4 or weights.shape[0] != 1:
+        logger.warning(
+            "Last-layer-eager self-test: unexpected attention shape %s.",
+            tuple(weights.shape),
+        )
+        return False
+    return True
+
+
+def _load_model_global_eager():
+    """The original loading path: forces eager on every layer. Used as the
+    safety-net fallback when the last-layer-only patch isn't applicable."""
+    tokenizer = AutoTokenizer.from_pretrained(CACD_CROSS_ENCODER_MODEL)
+    model     = AutoModelForSequenceClassification.from_pretrained(
+        CACD_CROSS_ENCODER_MODEL,
+        output_attentions=True,   # attention matrix required, not just logits
+    )
+    return tokenizer, model
+
+
 def get_cross_encoder():
     """Lazy-load cross-encoder model and tokenizer (pretrained, no fine-tuning)."""
-    global _tokenizer, _model
-    if _model is None:
-        logger.info("Loading cross-encoder: %s", CACD_CROSS_ENCODER_MODEL)
-        _tokenizer = AutoTokenizer.from_pretrained(CACD_CROSS_ENCODER_MODEL)
-        _model     = AutoModelForSequenceClassification.from_pretrained(
+    global _tokenizer, _model, _last_layer_capture_active
+    if _model is not None:
+        return _tokenizer, _model
+
+    logger.info("Loading cross-encoder: %s", CACD_CROSS_ENCODER_MODEL)
+
+    if not CACD_USE_LAST_LAYER_EAGER_ATTENTION:
+        _tokenizer, _model = _load_model_global_eager()
+        _last_layer_capture_active = False
+        logger.info("Cross-encoder loaded on %s (global eager, flag disabled)", DEVICE)
+    else:
+        # Fast path: load with the model's default attn_implementation
+        # (SDPA where available) and NO global output_attentions request,
+        # so every layer starts on the fast path.
+        tokenizer = AutoTokenizer.from_pretrained(CACD_CROSS_ENCODER_MODEL)
+        model     = AutoModelForSequenceClassification.from_pretrained(
             CACD_CROSS_ENCODER_MODEL,
-            output_attentions=True,   # attention matrix required, not just logits
         )
-        _model.to(DEVICE)
-        _model.eval()
-        logger.info("Cross-encoder loaded on %s", DEVICE)
+        model.to(DEVICE)
+        model.eval()
+
+        patched = _enable_last_layer_only_eager(model)
+        verified = patched and _self_test_last_layer_capture(tokenizer, model)
+
+        if verified:
+            _tokenizer, _model = tokenizer, model
+            _last_layer_capture_active = True
+            logger.info(
+                "Cross-encoder loaded on %s (last-layer-only eager, "
+                "self-test passed)", DEVICE,
+            )
+        else:
+            logger.warning(
+                "Last-layer-only eager patch failed self-test; "
+                "falling back to global eager loading (slower but known-good)."
+            )
+            _tokenizer, _model = _load_model_global_eager()
+            _tokenizer_dev = _model.to(DEVICE)
+            _model.eval()
+            _last_layer_capture_active = False
+            logger.info("Cross-encoder loaded on %s (global eager, fallback)", DEVICE)
+
     return _tokenizer, _model
+
+
+def _last_layer_attention(outputs, batch_i: int | None = None) -> torch.Tensor:
+    """
+    Retrieve the final layer's attention matrix for the just-completed
+    forward pass, regardless of which loading path is active.
+
+    - Last-layer-only-eager mode: read from the hook capture box (shape
+      (batch, num_heads, seq, seq)), then clear it so a forward pass that
+      for any reason produces no hook call (shouldn't happen, but defensive)
+      can't accidentally leak a stale tensor into the next call's results.
+    - Legacy global-eager mode: read outputs.attentions[-1] as before.
+
+    Args:
+        outputs : the model's forward-pass output object.
+        batch_i : if given, index into the batch dimension and return a
+                  single (num_heads, seq, seq) tensor for that item;
+                  if None, return the full (batch, num_heads, seq, seq)
+                  tensor as-is.
+    """
+    if _last_layer_capture_active:
+        weights = _captured_attn["weights"]
+        _captured_attn["weights"] = None
+        if weights is None:
+            raise RuntimeError(
+                "Last-layer-eager capture is active but no attention "
+                "weights were captured for this forward pass -- this "
+                "should not happen after a passing self-test; check for "
+                "a code path that bypasses get_cross_encoder()'s model "
+                "instance (e.g. a second model loaded separately)."
+            )
+    else:
+        weights = outputs.attentions[-1]
+
+    return weights if batch_i is None else weights[batch_i]
 
 
 def _max_alignment_coverage(
@@ -220,9 +437,8 @@ def score_pair(text_a: str, text_b: str) -> dict:
 
     # Last attention layer averaged across all heads.
     # The last layer carries the strongest semantic signal for the classification head.
-    attentions      = outputs.attentions          # tuple of (1, num_heads, seq, seq)
-    last_layer_attn = attentions[-1][0]           # (num_heads, seq, seq)
-    avg_attn        = last_layer_attn.mean(dim=0) # (seq, seq)
+    last_layer_attn = _last_layer_attention(outputs, batch_i=0)  # (num_heads, seq, seq)
+    avg_attn        = last_layer_attn.mean(dim=0)                # (seq, seq)
 
     input_ids = inputs["input_ids"][0]
     tokens    = tokenizer.convert_ids_to_tokens(input_ids)
@@ -327,8 +543,8 @@ def score_candidates_batched(
     with _autocast_ctx():
         outputs = model(**inputs)
 
-    logits_batch    = outputs.logits          # (batch, num_labels)
-    attentions_last = outputs.attentions[-1]  # (batch, num_heads, seq, seq)
+    logits_batch = outputs.logits  # (batch, num_labels)
+    attentions_last = _last_layer_attention(outputs)  # (batch, num_heads, seq, seq)
 
     for batch_i, (orig_i, cand) in enumerate(to_score):
         logits = logits_batch[batch_i]
@@ -412,8 +628,8 @@ def score_sentences_batched(candidate_text: str, sentences: list[str]) -> list[d
     with _autocast_ctx():
         outputs = model(**inputs)
 
-    logits_batch    = outputs.logits          # (batch, num_labels)
-    attentions_last = outputs.attentions[-1]  # (batch, num_heads, seq, seq)
+    logits_batch = outputs.logits  # (batch, num_labels)
+    attentions_last = _last_layer_attention(outputs)  # (batch, num_heads, seq, seq)
 
     results = []
     for batch_i in range(len(sentences)):
@@ -501,8 +717,8 @@ def score_pairs_batched(
         with _autocast_ctx():
             outputs = model(**inputs)
 
-        logits_batch    = outputs.logits
-        attentions_last  = outputs.attentions[-1]
+        logits_batch = outputs.logits
+        attentions_last = _last_layer_attention(outputs)
 
         for batch_i in range(len(sub)):
             logits = logits_batch[batch_i]
