@@ -27,6 +27,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
     HnswConfigDiff,
+    OptimizersConfigDiff,
     PointStruct,
     VectorParams,
 )
@@ -78,6 +79,18 @@ def ensure_collection(cname: str, recreate: bool = True) -> str:
             distance=Distance.COSINE,
         ),
         hnsw_config=HnswConfigDiff(m=16, ef_construct=100),
+        # Qdrant only builds a real HNSW graph for a segment once it holds
+        # more than optimizers_config.indexing_threshold points (default
+        # 20,000) -- below that it deliberately does a brute-force scan
+        # instead, on the assumption a graph isn't worth building yet.
+        # Our per-config collections here are ~5K-11K points, so under the
+        # default they NEVER get indexed and every Stage 1 query is an
+        # O(n) scan over everything ingested so far -- exactly the
+        # growing per-batch slowdown observed (6ms/chunk -> 60ms/chunk
+        # over one 9022-chunk run). Lowering the threshold forces Qdrant
+        # to index early so retrieval is the intended O(log n) HNSW
+        # lookup instead. 0 = index immediately, no minimum segment size.
+        optimizers_config=OptimizersConfigDiff(indexing_threshold=0),
     )
     logger.info(
         "Created collection '%s' (dense=%d-dim cosine)", cname, TEXT_EMBED_DIM
