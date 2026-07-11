@@ -113,8 +113,26 @@ def upsert_chunks(
     chunks: list[dict],
     dense_vecs: list[list[float]],
     batch_size: int = 256,
+    wait: bool = True,
 ) -> None:
-    """Upsert chunks into the collection in batches."""
+    """
+    Upsert chunks into the collection in batches.
+
+    Args:
+        wait: passed straight through to client.upsert(). True (default,
+              unchanged behaviour) blocks until Qdrant confirms the write
+              is durable/visible before returning. False skips that
+              confirmation -- if this turns out to actually be faster in
+              Local Mode, it means the "wait" step itself has overhead
+              beyond the raw write; if it makes no difference, Local
+              Mode's synchronous, single-process design means there was
+              nothing to skip. Either way, when wait=False this function
+              verifies the point count itself afterward (with a short
+              retry loop) before returning, so callers relying on an
+              immediate read right after (e.g. the RAG eval step) are not
+              exposed to a read-before-write race even if Qdrant's own
+              wait mechanism was skipped.
+    """
     client = get_client()
     for i in range(0, len(chunks), batch_size):
         batch_c = chunks[i : i + batch_size]
@@ -138,9 +156,37 @@ def upsert_chunks(
             )
             for chunk, dvec in zip(batch_c, batch_d)
         ]
-        client.upsert(collection_name=cname, points=points, wait=True)
+        client.upsert(collection_name=cname, points=points, wait=wait)
+
+    if not wait:
+        _verify_point_count(client, cname, expected_at_least=len(chunks))
 
     logger.info("Upserted %d points into '%s'", len(chunks), cname)
+
+
+def _verify_point_count(
+    client: QdrantClient, cname: str, expected_at_least: int,
+    max_wait_s: float = 5.0, poll_interval_s: float = 0.1,
+) -> None:
+    """
+    Safety net for wait=False: poll the collection's reported point count
+    until it reaches at least `expected_at_least`, or give up after
+    max_wait_s and log a warning (does not raise -- callers decide what to
+    do with stale data, this only makes the risk visible instead of silent).
+    """
+    import time as _time
+    deadline = _time.perf_counter() + max_wait_s
+    while _time.perf_counter() < deadline:
+        count = client.get_collection(cname).points_count
+        if count is not None and count >= expected_at_least:
+            return
+        _time.sleep(poll_interval_s)
+    logger.warning(
+        "upsert_chunks(wait=False): point count for '%s' did not reach "
+        "%d within %.1fs -- downstream reads may see incomplete data. "
+        "Consider reverting to wait=True.",
+        cname, expected_at_least, max_wait_s,
+    )
 
 
 def collection_stats(cname: str) -> dict:

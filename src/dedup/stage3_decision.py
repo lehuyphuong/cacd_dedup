@@ -761,13 +761,16 @@ def run_cacd_dedup(
         _t0 = _time.perf_counter()
         upsert_chunks(
             cname, all_upsert_chunks, all_upsert_vecs,
-            # Capped rather than fully unbounded: safe for embedded/local
-            # mode either way, but also keeps this reasonable if cname's
-            # backend is later switched to a real Qdrant server
-            # (QDRANT_URL), where a single gRPC/REST request has practical
-            # size limits. 5000 cuts an ~11K-chunk config from ~43 default
-            # round trips down to 2-3.
             batch_size=min(len(all_upsert_chunks), 5000),
+            # Experiment: skip Qdrant's own synchronous wait, backed by
+            # upsert_chunks' own point-count verification loop so a
+            # read-before-write race with the downstream eval step is
+            # still caught (and logged) rather than silently producing
+            # wrong Precision/Recall/IoU numbers. If this doesn't measurably
+            # help either, Local Mode's per-point SQLite write cost is the
+            # real floor here and wait itself was never the bottleneck --
+            # revert to wait=True (the previous, safe default) at that point.
+            wait=False,
         )
         _t_final_upsert = _time.perf_counter() - _t0
 
