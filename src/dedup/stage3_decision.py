@@ -37,6 +37,7 @@ from configs.settings import (
     CACD_COST_FALSE_POSITIVE,
     CACD_ENABLE_MERGE,
     CACD_INGEST_BATCH_SIZE,
+    CACD_TOP_K_CANDIDATES,
     HEATMAP_DIR,
     NIS_SENTENCE_NOVEL,
     MIN_NOVEL_CHARS,
@@ -45,7 +46,7 @@ from configs.settings import (
     MERGE_MAX_EMBED_CHARS,
 )
 from src.dedup.calibration import bayes_optimal_cutoff
-from src.dedup.stage1_coarse_retrieval import batch_coarse_retrieve
+from src.dedup.stage1_inmemory_retrieval import InMemoryIndex
 from src.dedup.stage2_cross_attention import (
     score_candidates,
     score_pairs_batched,
@@ -382,12 +383,28 @@ def run_cacd_dedup(
     Run the full CACD pipeline (Stage 1 => 2 => 3 + Merge) for one batch
     of chunks being ingested into collection `cname`.
 
+    ARCHITECTURE CHANGE (see conversation history): Stage 1 no longer
+    queries Qdrant. It searches an in-memory numpy pool of already-KEPT
+    chunk embeddings instead (src/dedup/stage1_inmemory_retrieval.py).
+    Qdrant is touched exactly ONCE per config, in bulk, at the very end of
+    this function -- purely to make the final kept set available for the
+    downstream RAG retrieval evaluation, the same pattern the non-CACD
+    baseline filters (Similarity, NERExact, ...) already used. This was a
+    deliberate trade-off after measuring that Qdrant's embedded/local
+    client mode (SQLite-backed, brute-force by design, not HNSW) made
+    per-chunk Stage 1 cost grow with collection size regardless of GPU
+    speed, K, or Qdrant-side config -- see stage1_inmemory_retrieval.py's
+    module docstring for the full writeup. This changes the paper's
+    originally-assumed Big-O for Stage 1 (Section III-B) from O(log n)
+    HNSW to O(pool_size) exact search, same asymptotic class as SIMILARITY;
+    report it as such if these numbers go in the paper, not silently.
+
     Chunks are processed in MICRO-BATCHES of `micro_batch_size` (default
     CACD_INGEST_BATCH_SIZE), not one at a time. Within a micro-batch:
       1. Stage 1 retrieves candidates for every chunk in the batch against
-         the index as it stood at the START of the batch (no chunk in a
-         batch sees another chunk from the SAME batch — see trade-off note
-         below).
+         the in-memory pool as it stood at the START of the batch (no
+         chunk in a batch sees another chunk from the SAME batch — see
+         trade-off note below).
       2. All (chunk, candidate) pairs across the whole batch are flattened
          into one list and scored in as few cross-encoder forward passes
          as possible via score_pairs_batched, instead of one forward pass
@@ -397,9 +414,10 @@ def run_cacd_dedup(
          identical logic to the previous fully-sequential version (see
          _vote_decision below — factored out but byte-for-byte the same
          rule as before).
-      4. All KEPT (and, if enabled, merged) chunks in the batch are
-         upserted into Qdrant in ONE batched call at the end of the batch,
-         rather than one upsert per chunk.
+      4. All KEPT (and, if enabled, merged) chunks in the batch are added
+         to the in-memory pool so later micro-batches can see them, and
+         accumulated into a running list that gets upserted into Qdrant
+         ONCE, after the whole loop finishes (see end of this function).
 
     Trade-off (staleness within a batch): because Stage 1 retrieval for the
     whole batch happens before any of the batch's decisions are known,
@@ -419,7 +437,9 @@ def run_cacd_dedup(
     Args:
         chunks           : list of chunk dicts with embeddings pre-computed.
         dense_vecs       : embedding vector for each chunk (same order).
-        cname            : Qdrant collection name (empty at start of ingest).
+        cname            : Qdrant collection name (empty at start of ingest;
+                           collection itself is still created by the caller
+                           via ensure_collection() as before).
         config_name      : benchmark config label (for heatmap paths/logs).
         embed_fn         : callable(list[str]) => list[list[float]].
                            Required for sentence-level merge to re-embed
@@ -435,6 +455,7 @@ def run_cacd_dedup(
     Returns:
         (kept_chunks, audit_log)
     """
+    from configs.settings import TEXT_EMBED_DIM
     from src.ingestion.vector_store import upsert_chunks
     import time as _time
 
@@ -444,18 +465,26 @@ def run_cacd_dedup(
     kept_chunks: list[dict] = []
     audit_log:   list[dict] = []
 
+    # In-memory Stage 1 index for this config (fresh pool per config, same
+    # lifecycle as the Qdrant collection it replaces during the decision
+    # loop). Also accumulate everything to upsert into Qdrant ONCE at the
+    # end, instead of once per micro-batch.
+    inmem_index = InMemoryIndex(dim=TEXT_EMBED_DIM)
+    all_upsert_chunks: list[dict] = []
+    all_upsert_vecs:   list[list[float]] = []
+
     # ── Diagnostic timing (added to root-cause an unexplained ingest-time
     # regression -- see conversation). Cumulative wall-clock time spent in
     # each stage across the whole ingest run, printed at the end. This is
     # deliberately coarse (perf_counter around each stage's code block, not
     # per-chunk) so it adds negligible overhead of its own and can be left
     # on without skewing the very numbers it's trying to measure.
-    _t_stage1  = 0.0   # Stage 1: batch_coarse_retrieve (Qdrant query)
+    _t_stage1  = 0.0   # Stage 1: in-memory numpy top-K search (was: Qdrant query)
     _t_stage2  = 0.0   # Stage 2: score_pairs_batched (cross-encoder forward passes)
     _t_stage3  = 0.0   # Stage 3: per-chunk voting (should be ~free, CPU only)
-    _t_upsert  = 0.0   # Qdrant upsert_chunks at the end of each micro-batch
+    _t_pool_add = 0.0  # appending newly-kept chunks into the in-memory pool
+    _t_final_upsert = 0.0  # ONE bulk Qdrant upsert at the very end
     _t_other   = 0.0   # guard filtering / bookkeeping between stages
-    _cross_encoder_load_logged = False
 
     def _vote_decision(chunk: dict, valid_scored: list[dict]):
         """
@@ -531,11 +560,9 @@ def run_cacd_dedup(
         batch_chunks = chunks[batch_start:batch_end]
         batch_vecs   = dense_vecs[batch_start:batch_end]
 
-        # ── Stage 1 (whole batch, one index snapshot) ───────────────────
+        # ── Stage 1 (whole batch, in-memory pool as it stood at batch start) ──
         _t0 = _time.perf_counter()
-        candidates_list, _ = batch_coarse_retrieve(
-            batch_chunks, batch_vecs, cname, top_k=None,
-        )
+        candidates_list = inmem_index.top_k(batch_vecs, k=CACD_TOP_K_CANDIDATES)
         _t_stage1 += _time.perf_counter() - _t0
         if not candidates_list:
             candidates_list = [[] for _ in batch_chunks]
@@ -704,11 +731,24 @@ def run_cacd_dedup(
                     PROB_LOW, PROB_HIGH, NIS_DROP_THRESHOLD, micro_batch_size,
                 )
 
-        # ── One batched upsert for everything kept/merged in this batch ──
+        # ── Add this batch's kept/merged chunks to the in-memory pool (so
+        # later micro-batches can retrieve against them, same timing as the
+        # old per-batch Qdrant upsert) and accumulate for ONE bulk Qdrant
+        # upsert after the whole loop finishes ──
         if to_upsert_chunks:
             _t0 = _time.perf_counter()
-            upsert_chunks(cname, to_upsert_chunks, to_upsert_vecs)
-            _t_upsert += _time.perf_counter() - _t0
+            inmem_index.add(to_upsert_chunks, to_upsert_vecs)
+            _t_pool_add += _time.perf_counter() - _t0
+            all_upsert_chunks.extend(to_upsert_chunks)
+            all_upsert_vecs.extend(to_upsert_vecs)
+
+    # ── ONE bulk upsert into Qdrant for the whole config, purely so the
+    # final kept set is available for the downstream RAG retrieval
+    # evaluation step -- Qdrant played no role in any decision above ──
+    if all_upsert_chunks:
+        _t0 = _time.perf_counter()
+        upsert_chunks(cname, all_upsert_chunks, all_upsert_vecs)
+        _t_final_upsert = _time.perf_counter() - _t0
 
     logger.info(
         "  CACD done: %d => %d chunks kept "
@@ -717,7 +757,7 @@ def run_cacd_dedup(
         PROB_LOW, PROB_HIGH, NIS_DROP_THRESHOLD, micro_batch_size,
     )
 
-    _t_total = _t_stage1 + _t_stage2 + _t_stage3 + _t_upsert + _t_other
+    _t_total = _t_stage1 + _t_stage2 + _t_stage3 + _t_pool_add + _t_final_upsert + _t_other
     from configs.settings import DEVICE as _device
     try:
         import torch as _torch
@@ -727,15 +767,17 @@ def run_cacd_dedup(
         _cuda_ok, _gpu_name = None, "unknown"
     logger.info(
         "  CACD timing breakdown (%.1fs total): "
-        "Stage1(retrieval)=%.1fs (%.0f%%) | "
+        "Stage1(in-memory retrieval)=%.1fs (%.0f%%) | "
         "Stage2(cross-encoder)=%.1fs (%.0f%%) | "
         "Stage3(voting)=%.1fs (%.0f%%) | "
-        "upsert=%.1fs (%.0f%%) | other=%.1fs (%.0f%%)",
+        "pool_add=%.1fs (%.0f%%) | "
+        "final_upsert(1x, Qdrant)=%.1fs (%.0f%%) | other=%.1fs (%.0f%%)",
         _t_total,
         _t_stage1, 100 * _t_stage1 / max(_t_total, 1e-9),
         _t_stage2, 100 * _t_stage2 / max(_t_total, 1e-9),
         _t_stage3, 100 * _t_stage3 / max(_t_total, 1e-9),
-        _t_upsert, 100 * _t_upsert / max(_t_total, 1e-9),
+        _t_pool_add, 100 * _t_pool_add / max(_t_total, 1e-9),
+        _t_final_upsert, 100 * _t_final_upsert / max(_t_total, 1e-9),
         _t_other,  100 * _t_other  / max(_t_total, 1e-9),
     )
     logger.info(
