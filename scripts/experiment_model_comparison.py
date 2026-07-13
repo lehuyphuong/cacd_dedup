@@ -29,7 +29,7 @@ import numpy as np
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# Config
 
 DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"
 OUT_DIR = Path("results/model_comparison")
@@ -75,7 +75,7 @@ MODELS = [
     "cross-encoder/stsb-roberta-base",
 ]
 
-# ── 5 experimental chunk pairs ────────────────────────────────────────────────
+# 5 experimental chunk pairs
 
 PAIRS = {
     "case1_identical": {
@@ -113,7 +113,7 @@ PAIRS = {
 # Ground-truth: case1 & case2 => DROP, case3-5 => KEEP
 EXPECTED = {k: v["expected"] for k, v in PAIRS.items()}
 
-# ── Scoring ───────────────────────────────────────────────────────────────────
+# Scoring
 
 def score_pair(text_a: str, text_b: str, tokenizer, model) -> dict:
     inputs = tokenizer(
@@ -201,7 +201,7 @@ def decide(result: dict) -> str:
     return "KEEP"
 
 
-# ── Heatmap ───────────────────────────────────────────────────────────────────
+# Heatmap
 
 def plot_heatmap(result: dict, case_key: str, case_label: str,
                  decision: str, expected: str, model_slug: str,
@@ -254,7 +254,7 @@ def plot_heatmap(result: dict, case_key: str, case_label: str,
     return str(out_path)
 
 
-# ── Per-model runner ──────────────────────────────────────────────────────────
+# Per-model runner
 
 def run_model(model_name: str, summary_rows: list) -> None:
     slug = model_name.replace("/", "__").replace("-", "_")
@@ -338,7 +338,7 @@ def run_model(model_name: str, summary_rows: list) -> None:
         torch.cuda.empty_cache()
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# Main
 
 def main():
     print("CACD — Model Comparison Experiment")

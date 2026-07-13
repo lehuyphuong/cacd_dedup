@@ -2,29 +2,23 @@
 
 **Cross-Attention Calibrated Deduplication (CACD)** — a chunk-filtering method for RAG that replaces fixed cosine-similarity thresholds with a cross-encoder pipeline producing a calibrated decision signal.
 
-Standalone project, separated from `rag-bench-v4`. Keeps the same chunking strategies for evaluation, but replaces all 5 of the paper's filter methods (NoFilter / ExactNorm / MinHashLSH / Similarity / NERExact) with a single pipeline: **CACD**.
+Standalone project. Keeps the same chunking strategies used to evaluate the earlier baseline filters (NoFilter / ExactNorm / MinHashLSH / Similarity / NERExact, in the companion [rag_bench](https://github.com/lehuyphuong/rag_bench) repository) but replaces all five of those filter methods with a single pipeline: **CACD**.
 
 ---
 
 ## 1. Problem CACD addresses
 
-Cosine similarity on pooled embeddings reduces the "are these two chunks duplicates?" question to a single number compared against a fixed threshold (typically 0.8) with no principled justification. Benchmarking on `rag-bench-v4` (500 SQuAD documents) showed the concrete consequence:
-
-| Filter | Strategy affected | Recall delta |
-|---|---|---|
-| NERExact | Contextual | **-0.143** |
-| NERExact | TopicBased | **-0.131** |
-
-Cause: chunks that look superficially similar (shared header text, shared named entities introduced by the chunking structure itself) get flagged as "duplicates" even though their actual content differs — a failure mode referred to here as **false redundancy**.
+Cosine similarity on pooled embeddings reduces the "are these two chunks duplicates?" question to a single number compared against a fixed threshold (typically 0.8) with no principled justification. Chunks that look superficially similar (shared header text, shared named entities introduced by the chunking structure itself) can get flagged as "duplicates" even though their actual content differs — a failure mode referred to here as **false-redundancy collapse**.
 
 CACD addresses this by:
 1. Using a **cross-encoder** (joint encoding of both chunks, not two independent vectors) to preserve token-level detail all the way to the final comparison step.
-2. Extracting the **attention matrix** instead of collapsing to a single similarity score — this identifies exactly which parts of the two chunks actually correspond to each other.
-3. Producing two complementary signals — a **calibrated duplicate probability** from the cross-encoder output, and a **Novel Information Score (NIS)** derived from attention entropy — combined through a 3-zone decision rule plus a length-aware guard, rather than a single hand-picked constant.
+2. Extracting the **attention matrix** instead of collapsing to a single similarity score, to identify exactly which parts of the two chunks correspond to each other.
+3. Producing two complementary signals, a **calibrated duplicate probability** from the cross-encoder output and a **Novel Information Score (NIS)** derived from attention entropy, combined through a 3-zone decision rule plus a length-aware guard rather than a single hand-picked constant.
+4. Deciding via **majority vote** across several retrieved candidates, so one misleading nearest neighbor cannot flip the decision on its own.
 
 ---
 
-## 2. CACD Pipeline (4 stages)
+## 2. CACD Pipeline (3 stages)
 
 ```
 New chunk
@@ -34,10 +28,10 @@ Stage 0 — Embedding
     all-MiniLM-L6-v2, 384-dim vector
     |
     v
-Stage 1 — Coarse retrieval (HNSW, batch query)
-    Retrieves top-K nearest neighbours already present in Qdrant
-    (persistent index — not reset between ingest batches)
-    Complexity: O(m log n)
+Stage 1 — Coarse retrieval (in-memory, exact top-K)
+    Retrieves the K nearest chunks already decided KEEP, from a growing
+    in-memory pool of embeddings (not an external vector store)
+    Complexity: O(pool_size) per query
     |
     v  (only K candidates, K=5 by default)
 Stage 2 — Cross-attention redundancy scoring
@@ -46,17 +40,20 @@ Stage 2 — Cross-attention redundancy scoring
     2c. Compute coverage signals (max-alignment, BERTScore-style)
     2d. Compute Novel Information Score (NIS) from attention B=>A entropy
     Model: cross-encoder/msmarco-MiniLM-L6-en-de-v1 (pretrained, no fine-tuning)
-    Batched forward pass: all K candidates scored in a single GPU call.
+    Batched forward pass: many (chunk, candidate) pairs scored per GPU call.
     |
     v
-Stage 3 — 3-zone decision + length-aware guard
+Stage 3 — 3-zone decision + length-aware guard, majority vote across K
     prob >= PROB_HIGH                => DROP (unless length guard applies)
     prob <= PROB_LOW                 => KEEP
     PROB_LOW < prob < PROB_HIGH      => NIS decides (NIS < threshold => DROP)
     chunk longer than LENGTH_GUARD chars is protected unless NIS < NIS_FLOOR
 ```
 
-**Scope note**: this implementation only has a DROP branch — there is no Merge step. A chunk identified as redundant is excluded from the index entirely; partial-overlap cases (two chunks sharing roughly half their content) are resolved by keeping one and dropping the other rather than merging the non-overlapping portions. Comparing Drop vs. Merge is left for future work.
+A chunk voted DROP is discarded. Qdrant is touched once per chunking
+configuration, in a single bulk upsert after the whole ingest run, purely
+so the final kept set is available for the retrieval-quality evaluation
+step; it plays no role in the Stage 1-3 decision itself.
 
 ---
 
@@ -78,22 +75,9 @@ Stage 3 — 3-zone decision + length-aware guard
 
 ---
 
-## 4. Evaluation Metrics
+## 4. Setup and usage
 
-| Metric | Formula |
-|---|---|
-| Precision | \|Te ∩ Tr\| / \|Tr\| |
-| Recall | \|Te ∩ Tr\| / \|Te\| |
-| IoU | \|Te ∩ Tr\| / \|Te ∪ Tr\| |
-| Index Size | chunk_count_after_filter + storage_mb |
-
-Computed under two tokenization modes: `raw` (lowercase word tokens) and `preprocessed` (stopword removal + lemmatization via spaCy).
-
----
-
-## 5. Setup and usage
-
-### 5.1 Setup
+### 4.1 Setup
 
 ```bash
 python3 -m venv venv
@@ -107,7 +91,7 @@ The first run downloads:
 - `sentence-transformers/all-MiniLM-L6-v2` (~80MB) — Stage 0
 - `cross-encoder/msmarco-MiniLM-L6-en-de-v1` (~90MB) — Stage 2
 
-### 5.2 Verify installation
+### 4.2 Verify installation
 
 ```bash
 python -c "from sentence_transformers import SentenceTransformer; m = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2'); print('embed OK:', m.encode(['test']).shape)"
@@ -116,14 +100,13 @@ python -c "from qdrant_client import QdrantClient; c = QdrantClient(':memory:');
 python -c "import torch; print('GPU available:', torch.cuda.is_available())"
 ```
 
-### 5.3 Run benchmark
+### 4.3 Run benchmark
 
 ```bash
 # Quick debug (20 docs, 30 questions)
 python scripts/benchmark.py --max-docs 20 --max-questions 30
 
-# Single strategy — Contextual is a good starting point: it is the case
-# where the old NERExact baseline degraded Recall the most (-0.143)
+# Single strategy
 python scripts/benchmark.py --strategy Contextual --max-docs 50 --max-questions 50
 
 # Single config
@@ -132,12 +115,15 @@ python scripts/benchmark.py --config "Contextual_300_0"
 # Full benchmark (all 18 configs)
 python scripts/benchmark.py
 
+# Keep Qdrant collections after each config instead of deleting them
+python scripts/benchmark.py --keep-collections
+
 # Background run
 nohup python scripts/benchmark.py > results/bench.log 2>&1 &
 tail -f results/bench.log
 ```
 
-### 5.4 Inspect results
+### 4.4 Inspect results
 
 ```bash
 # View the results CSV
@@ -145,15 +131,11 @@ column -t -s',' results/benchmark_results.csv | less -S
 
 # View the audit log (drop/keep decision for each chunk, with P(duplicate) and NIS)
 column -t -s',' results/audit_Contextual_300_0.csv | less -S
-
-# View attention heatmaps (disabled by default — see Section 8)
-open results/heatmaps/Contextual_300_0/   # macOS
-xdg-open results/heatmaps/Contextual_300_0/  # Linux
 ```
 
 ---
 
-## 6. Output
+## 5. Output
 
 ### `results/benchmark_results.csv` — one row per config
 
@@ -162,23 +144,25 @@ xdg-open results/heatmaps/Contextual_300_0/  # Linux
 | `config_name` | e.g. `Contextual_300_0` |
 | `chunk_count_before_filter` / `chunk_count_after_filter` | Chunk count before/after CACD dedup |
 | `filter_reduction_pct` | Percentage of chunks dropped |
-| `ingest_time_s` | Total time: chunking + CACD (4 stages) + upsert |
+| `ingest_time_s` | Total time: chunking + embedding + CACD (Stage 1-3) + upsert |
 | `storage_mb` / `storage_du` | Qdrant collection disk size |
 | `precision_raw` / `recall_raw` / `iou_raw` | Token metrics, raw mode |
 | `precision_pre` / `recall_pre` / `iou_pre` | Token metrics, preprocessed mode |
+| `avg_retrieval_ms` | Mean retrieval latency at evaluation time |
+| `n_questions` | Number of questions evaluated |
 | `cacd_prob_high` / `cacd_prob_low` / `cacd_nis_threshold` | Decision thresholds actually used for this run |
+
+### `results/per_question_{config_name}.csv` — one row per evaluated question
+
+`config_name`, `question`, `doc_id`, `precision_raw`, `recall_raw`, `iou_raw`, `precision_pre`, `recall_pre`, `iou_pre`, `retrieval_ms`.
 
 ### `results/audit_{config_name}.csv` — one row per chunk
 
-Records the CACD decision for each chunk: `decision` (drop/keep), `reason` (which zone/guard triggered the decision), `best_p_duplicate`, `best_candidate_id`, `nis_b_given_a`, `coverage_a_to_b`, `coverage_b_to_a`, `redundancy_signal`.
-
-### `results/heatmaps/{config_name}/*.png`
-
-Attention-matrix heatmap between a new chunk and its nearest candidate — X axis is the candidate (B), Y axis is the new chunk (A); darker cells indicate higher attention weight. Disabled by default to reduce ingest time (see `save_heatmap` in `stage3_decision.py`, commented out at the call site); uncomment to re-enable, up to `max_heatmaps` per config.
+Records the CACD decision for each chunk: `chunk_id`, `decision` (drop/keep), `reason` (which zone/guard triggered the decision), `best_p_duplicate`, `best_candidate_id`, `nis_b_given_a`, `coverage_a_to_b`, `coverage_b_to_a`, `redundancy_signal`, `prob_high`, `prob_low`, `nis_threshold`.
 
 ---
 
-## 7. Project structure
+## 6. Project structure
 
 ```
 cacd-dedup/
@@ -189,39 +173,28 @@ cacd-dedup/
 │   │   ├── loader.py            # SQuAD 1.1 loader
 │   │   ├── chunker.py           # 9 chunking strategies
 │   │   ├── embedder.py          # all-MiniLM-L6-v2 (Stage 0, GPU-aware)
-│   │   └── vector_store.py      # Qdrant embedded — persistent index
+│   │   └── vector_store.py      # Qdrant wrapper (final storage only)
 │   ├── dedup/
-│   │   ├── stage1_coarse_retrieval.py   # Batch HNSW query
-│   │   ├── stage2_cross_attention.py    # Cross-encoder + attention extraction (batched)
-│   │   ├── calibration.py               # Bayes-optimal cutoff
-│   │   └── stage3_decision.py           # 3-zone decision + length-aware guard
+│   │   ├── stage1_inmemory_retrieval.py  # Stage 1: in-memory top-K search
+│   │   ├── stage2_cross_attention.py     # Stage 2: cross-encoder + attention (batched)
+│   │   ├── calibration.py                # Bayes-optimal cutoff
+│   │   └── stage3_decision.py            # Stage 3: decision rule + pipeline orchestration
 │   ├── retrieval/
 │   │   └── retriever.py         # Dense cosine retrieval (final evaluation)
 │   ├── evaluation/
-│   │   └── metrics.py           # Precision/Recall/IoU
+│   │   ├── metrics.py           # Precision/Recall/IoU
+│   │   └── generator.py         # Answer generation (optional, unused by default)
 │   └── utils/
 │       └── logger.py
 ├── scripts/
 │   ├── benchmark.py                      # Main CLI
-│   ├── experiment_calibration.py         # 5-pair sanity check (no benchmark dependency)
 │   └── experiment_model_comparison.py    # 37-model cross-encoder comparison
 ├── data/
-│   └── qdrant_storage/          # Qdrant collections
+│   └── qdrant_storage/          # Qdrant collections (embedded mode)
 ├── results/
-│   ├── heatmaps/                # Attention heatmap PNGs per config (disabled by default)
 │   ├── benchmark_results.csv
 │   ├── per_question_*.csv
 │   └── audit_*.csv
 ├── requirements.txt
 └── README.md
 ```
-
----
-
-## 8. Known limitations
-
-- **DROP branch only, no Merge.** Partial-overlap cases (two chunks sharing roughly 50% of their content) are resolved binarily — one chunk is kept, the other dropped — risking loss of the unique information in the dropped chunk. This is a known limitation reserved for a future Merge experiment.
-- **Cross-encoder is pretrained, not fine-tuned.** `msmarco-MiniLM-L6-en-de-v1` was trained for passage relevance ranking (MS MARCO), not binary duplicate classification. The model was selected via a 37-model comparison experiment (`scripts/experiment_model_comparison.py`) rather than fine-tuned on labeled duplicate pairs.
-- **NIS_DROP_THRESHOLD saturates at 0.8 on SQuAD.** Values from 0.8 to 0.9 produce identical results because `LENGTH_GUARD` (300 characters) controls the majority of decisions once the probability threshold is satisfied. This has not been validated on datasets with different chunk-length distributions.
-- **Heatmap generation is disabled by default** to reduce ingest time; re-enabling it (see Section 6) adds meaningful overhead per chunk during ingest.
-- **Stage 1 (HNSW via Qdrant) runs on CPU only** — no GPU-accelerated ANN backend (e.g. cuVS/FAISS-GPU) is wired in, though the batch-query architecture would support one without changing the decision logic.

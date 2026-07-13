@@ -58,14 +58,14 @@ from src.utils.logger import configure_logging
 logger = logging.getLogger(__name__)
 
 
-# ── Config name ───────────────────────────────────────────────────────────────
+# Config name
 
 def make_config_name(strategy: str, chunk_size: int, overlap: int) -> str:
     """Format: "{strategy}_{size}_{overlap}" — one CACD pipeline per config."""
     return f"{strategy}_{chunk_size}_{overlap}"
 
 
-# ── CSV fields ────────────────────────────────────────────────────────────────
+# CSV fields
 
 SUMMARY_FIELDS = [
     "config_name", "strategy", "chunk_size", "overlap",
@@ -99,7 +99,7 @@ AUDIT_FIELDS = [
 ]
 
 
-# ── Ingest (CACD) ─────────────────────────────────────────────────────────────
+# Ingest (CACD)
 
 def run_ingest_cacd(
     documents:   list[dict],
@@ -111,8 +111,9 @@ def run_ingest_cacd(
     extra:       dict | None = None,
 ) -> tuple[list[dict], list[dict], float, str, dict, list[dict]]:
     """
-    Chunk => CACD dedup (Stage 1-3, drop only; chunks are inserted into
-    Qdrant incrementally inside run_cacd_dedup) for one chunking config.
+    Chunk => CACD dedup (Stage 1-3) for one chunking config. Kept chunks
+    are upserted into Qdrant once, at the end of run_cacd_dedup, so the
+    collection is available for the retrieval evaluation step below.
 
     Returns (chunks_before, chunks_after, ingest_time_s, cname, stats, audit_log).
     """
@@ -132,17 +133,15 @@ def run_ingest_cacd(
         embedded_chunks.append(chunk)
         dense_vecs.append(dv)
 
-    # Step 3: Create an empty collection; run_cacd_dedup inserts chunks
-    # incrementally so each new chunk is checked against the already-indexed ones.
+    # Step 3: Create an empty collection; run_cacd_dedup upserts the kept
+    # chunks into it once, at the end.
     cname = collection_name(strategy, chunk_size, overlap, "cacd")
     ensure_collection(cname, recreate=True)
 
-    # Step 4: Run CACD (Stage 1 => 2 => 3 + Merge)
-    # embed_fn is passed so that sentence-level merge can re-embed B_merged.
+    # Step 4: Run CACD (Stage 1 => 2 => 3)
     kept_chunks, audit_log = run_cacd_dedup(
         embedded_chunks, dense_vecs, cname, config_name,
         embed_fn=embed_fn,
-        save_heatmaps=True,
         chunk_size=chunk_size,
     )
 
@@ -156,7 +155,7 @@ def run_ingest_cacd(
     return chunks_raw, kept_chunks, ingest_time, cname, stats, audit_log
 
 
-# ── Evaluate ──────────────────────────────────────────────────────────────────
+# Evaluate
 
 def run_eval(
     qa_pairs:   list[dict],
@@ -229,7 +228,7 @@ def run_eval(
     return summary, per_q_rows
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# Main
 
 def main() -> None:
     configure_logging()
@@ -285,7 +284,7 @@ def main() -> None:
 
     logger.info("Running %d configs.", len(configs))
 
-    # ── Warm up both lazy-loaded models BEFORE the timed loop ──────────────
+    # Warm up both lazy-loaded models BEFORE the timed loop
     # get_model() (bi-encoder, used by embed_chunks_batched/embed_texts) and
     # get_cross_encoder() (Stage 2) are both cached on first call via module-
     # level globals — so without an explicit warmup here, the FIRST config

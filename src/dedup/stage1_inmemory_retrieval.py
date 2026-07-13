@@ -1,58 +1,29 @@
 """
-CACD Stage 1 — In-Memory Coarse Retrieval (numpy top-K, no vector-store round trip).
+CACD Stage 1 — In-Memory Coarse Retrieval.
 
-Role: same as stage1_coarse_retrieval.py (narrow the candidate set from n down
-to K before Stage 2's cross-encoder), but the "index I" from the paper is now
-an in-memory, growing numpy array instead of a persistent Qdrant collection.
+Role: narrow the candidate set from the full index down to K nearest
+neighbours before Stage 2's cross-encoder scores them.
 
-Why this exists (see conversation history / CACD_context_handoff.md):
-  The original Qdrant-backed Stage 1 (stage1_coarse_retrieval.py) round-trips
-  to QdrantClient(path=...) ("Local Mode") once per micro-batch. Local Mode
-  is documented by qdrant-client itself as brute-force only (no HNSW) and
-  SQLite-backed on disk -- "designed for development, testing, demos, and
-  small-scale datasets (up to ~20,000 points)", not for an incremental
-  upsert+query loop running hundreds of times per config. Measured on this
-  project: per-chunk Stage 1 cost grew from ~6ms to ~60ms over a single
-  9022-chunk run as the collection grew, dominating total ingest time (~74%)
-  regardless of GPU speed, K, or Qdrant HNSW/optimizer settings (none of
-  which Local Mode actually honours).
+The index is a single growing in-memory matrix of unit-normalized chunk
+embeddings, searched with an exact (not approximate) vectorized
+matrix-vector product. This finds the true top-K nearest neighbours under
+cosine similarity, unlike an approximate index such as HNSW, at O(pool_size)
+cost per query instead of O(log pool_size). At the corpus sizes this
+project evaluates (roughly 2,000-16,000 chunks per configuration), the
+per-query cost of an in-process matrix multiply is small enough that this
+trade-off is favorable in practice.
 
-  rag_bench (the earlier, no-CACD baseline codebase for this paper) never
-  hit this problem because its filters (Similarity, NERExact, ...) operate
-  entirely in-memory on the full chunk list and touch Qdrant exactly once,
-  in bulk, AFTER filtering decisions are made -- never during them. This
-  module ports that pattern into CACD's Stage 1: chunk embeddings already
-  decided KEEP are kept in a plain in-memory numpy array (a few thousand
-  x 384 floats is a few MB -- trivial), and Stage 1 becomes a vectorized
-  matrix-multiply top-K search (query_vecs @ pool_vecs.T) instead of a
-  network/disk round trip. Qdrant itself is untouched during the decision
-  loop; stage3_decision.py now upserts everything ONCE at the end of a
-  config's ingest, purely to make the final kept set available for the
-  downstream RAG retrieval evaluation step -- exactly like the other
-  (non-CACD) baseline filters already do.
-
-  Complexity trade-off (explicit, matches the paper's own note that
-  SIMILARITY's O(N^2) cost is accepted for its dataset sizes): this makes
-  Stage 1 an exact O(pool_size) search per chunk rather than the paper's
-  originally-assumed O(log n) HNSW lookup, so cumulative Stage 1 cost is
-  O(N^2) over a full ingest, same asymptotic class as the SIMILARITY
-  baseline. In wall-clock terms this is still dramatically faster here
-  because the per-call constant is now a single BLAS matmul in RAM instead
-  of a disk-backed SQLite round trip -- at these corpus sizes (~5K-11K
-  chunks, 384-dim) the full cumulative cost is well under a second. This is
-  a genuine change from the paper's original Big-O framing (Section III-B)
-  and should be described as such if reported, not silently substituted.
+Qdrant is not used during this stage; it is only used once, at the end of
+a full ingest run, to persist the final kept chunks for retrieval
+evaluation (see src/dedup/stage3_decision.py and src/ingestion/vector_store.py).
 
 Public API:
-  InMemoryIndex(dim)      — one instance per chunking-strategy config,
-                             mirrors the lifecycle of one Qdrant collection.
-  .top_k(query_vecs, k)   — batched top-K search, returns the SAME candidate
-                             dict shape as batch_coarse_retrieve() so Stage 2
-                             / Stage 3 / the guards need no changes at all.
-  .add(chunks, vecs)      — append newly-KEPT chunks to the pool (call this
-                             once per micro-batch, after Stage 3's decisions
-                             are known -- same timing as the old per-batch
-                             Qdrant upsert, just without the round trip).
+  InMemoryIndex(dim)    -- one instance per chunking-strategy config.
+  .top_k(query_vecs, k) -- batched top-K search; returns candidate dicts
+                           with the same shape as a Qdrant hit
+                           (chunk_id, doc_id, title, text, score,
+                           parent_id, level).
+  .add(chunks, vecs)    -- append newly-kept chunks to the pool.
 """
 
 from __future__ import annotations
@@ -65,14 +36,9 @@ logger = logging.getLogger(__name__)
 
 
 def _l2_normalize(vecs: np.ndarray) -> np.ndarray:
-    """
-    Defensive L2 normalization so a plain dot product equals cosine
-    similarity. Mirrors rag_bench's Similarity filter, which does the same
-    "should already be normalized but just in case" renormalization -- the
-    embedder is expected to output unit vectors, but Stage 1's correctness
-    (and CACD's redundancy decisions downstream) must not silently depend
-    on that never changing.
-    """
+    """L2-normalize rows so a dot product equals cosine similarity.
+    Defensive: the embedder is expected to already output unit vectors,
+    but correctness here should not silently depend on that."""
     if vecs.size == 0:
         return vecs
     norms = np.linalg.norm(vecs, axis=1, keepdims=True)
@@ -82,11 +48,9 @@ def _l2_normalize(vecs: np.ndarray) -> np.ndarray:
 
 class InMemoryIndex:
     """
-    Growing in-memory pool of (vector, metadata) for chunks already decided
-    KEEP in the current config's ingest run. One instance per chunking
-    config -- create a fresh one exactly where the old code called
-    ensure_collection(cname, recreate=True), i.e. once per config, not once
-    per corpus.
+    Growing in-memory pool of (vector, metadata) for chunks already kept
+    in the current config's ingest run. Create one fresh instance per
+    chunking configuration.
     """
 
     def __init__(self, dim: int):
@@ -107,12 +71,10 @@ class InMemoryIndex:
             k         : number of candidates to return per query.
 
         Returns:
-            list of length m; each entry is a list of up to k candidate
-            dicts, sorted by descending cosine score, with the SAME fields
-            batch_coarse_retrieve() produced from Qdrant hits:
-            chunk_id, doc_id, title, text, score, parent_id, level.
-            Empty list for a query if the pool is currently empty --
-            matches the old "collection has no points yet" behaviour.
+            List of length m; each entry is a list of up to k candidate
+            dicts (chunk_id, doc_id, title, text, score, parent_id, level),
+            sorted by descending cosine score. Empty list for a query if
+            the pool is currently empty.
         """
         m = len(query_vecs)
         if m == 0:
@@ -156,10 +118,9 @@ class InMemoryIndex:
     def add(self, chunks: list[dict], vecs: list[list[float]]) -> None:
         """
         Append newly-kept chunks to the pool. Call once per micro-batch,
-        after Stage 3 has decided which chunks in that batch are KEEP/MERGE
-        -- matches the staleness contract already documented in
-        stage3_decision.run_cacd_dedup: chunks within the same micro-batch
-        never see each other, only chunks added by earlier batches do.
+        after Stage 3 has decided which chunks in that batch to keep.
+        Chunks within the same micro-batch never see each other; only
+        chunks added by earlier batches are visible to later ones.
         """
         if not chunks:
             return

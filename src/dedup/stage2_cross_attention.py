@@ -1,23 +1,32 @@
 """
-CACD Stage 2 — Cross-Attention Redundancy Scorer (CARS).
+CACD Stage 2 — Cross-Attention Redundancy Scorer.
 
-Role: for each pair (new_chunk, candidate_i), produce a redundancy signal
-by jointly encoding both texts through a cross-encoder and extracting
+Role: for each pair (new_chunk, candidate), produce a redundancy signal by
+jointly encoding both texts through a cross-encoder and extracting
 information from the resulting attention matrix.
 
 Pipeline:
-  2a. Joint encoding : [CLS] new_chunk [SEP] candidate_i [SEP]
-  2b. Attention extraction : last layer, averaged across all heads
-  2c. Coverage signals : max-alignment coverage (BERTScore-style)
-  2d. Novel Information Score (NIS) : entropy of attention B => A
+  1. Joint encoding: [CLS] new_chunk [SEP] candidate [SEP]
+  2. Attention extraction: last transformer layer, averaged across heads
+  3. Coverage signals: max-alignment coverage (BERTScore-style)
+  4. Novel Information Score (NIS): entropy of attention candidate=>new_chunk
 
 Model: cross-encoder/msmarco-MiniLM-L6-en-de-v1 (pretrained, no fine-tuning).
-Complexity: O(K) forward passes per new chunk; K is a small constant
-            (CACD_TOP_K_CANDIDATES) because Stage 1 already narrowed candidates.
+
+Attention capture: only the model's final transformer layer is forced into
+eager attention mode (see _enable_last_layer_only_eager below); every other
+layer keeps the faster default attention implementation. This is
+functionally identical to requesting attention output from the whole model,
+just faster, since NIS only ever reads the final layer.
 
 Public API:
-  score_pair(text_a, text_b)          => dict of scores for one pair
-  score_candidates(chunk_text, cands) => list of scored candidate dicts
+  get_cross_encoder()                    -> (tokenizer, model), lazy-loaded
+  score_pair(text_a, text_b)             -> dict of scores for one pair
+  score_candidates(...)                  -> list of scored candidate dicts
+  score_candidates_batched(...)          -> batched version of the above
+  score_pairs_batched(pairs)             -> scores an arbitrary list of
+                                             (text_a, text_b) pairs in one
+                                             or more batched forward passes
 """
 
 from __future__ import annotations
@@ -43,30 +52,21 @@ _tokenizer = None
 _model     = None
 
 # True once get_cross_encoder() has confirmed the last-layer-only-eager patch
-# is active and self-tested successfully; False means we're on the old,
-# slower global-eager fallback (either by choice via the settings flag, or
-# because the self-test failed). Read by the scoring functions to decide
-# whether to pull attention from the capture box below or from
-# outputs.attentions[-1] as before.
+# is active and self-tested. False means the model is running the slower
+# global-eager fallback, either because CACD_USE_LAST_LAYER_EAGER_ATTENTION
+# is off or because the self-test failed on this model/transformers version.
 _last_layer_capture_active = False
 
-# Mutable "box" the forward hook writes into. A plain dict (not a variable)
-# so the hook closure can mutate it without needing `nonlocal`/`global`.
-# Forward passes in this codebase are always run sequentially to completion
-# before the next one starts (no overlapping/async forward calls), so a
-# single shared slot -- overwritten and read back within the same call --
-# is safe; it is not meant to survive across calls.
+# Mutable box the forward hook writes captured attention weights into.
+# A dict (not a plain variable) so the hook closure can mutate it without
+# `nonlocal`/`global`. Forward passes run sequentially in this codebase, so
+# one shared slot, overwritten and read back within the same call, is safe.
 _captured_attn: dict = {"weights": None}
 
 
 def _autocast_ctx():
-    """
-    Mixed-precision context for the cross-encoder forward pass.
-
-    Only enabled on CUDA: torch.autocast on CPU does not speed anything up
-    and can even be slower, so this is a deliberate no-op (nullcontext) for
-    CPU-only runs regardless of CACD_USE_FP16.
-    """
+    """Mixed-precision context for the cross-encoder forward pass. Enabled
+    only on CUDA; a no-op on CPU regardless of CACD_USE_FP16."""
     if CACD_USE_FP16 and DEVICE == "cuda":
         return torch.autocast(device_type="cuda", dtype=torch.float16)
     return contextlib.nullcontext()
@@ -76,14 +76,10 @@ def _find_last_self_attention_module(model):
     """
     Locate the final transformer layer's self-attention submodule (e.g.
     model.bert.encoder.layer[-1].attention.self for a BERT-family
-    sequence-classification model), the way HuggingFace assembles them for
-    AutoModelForSequenceClassification checkpoints such as our cross-encoder.
+    sequence-classification model).
 
-    Returns the submodule, or None if the model doesn't match the expected
-    BERT-style structure (caller must treat None as "patch not applicable"
-    and fall back to the old global-eager path rather than crashing —
-    other cross-encoder architectures use different attribute names and
-    are simply out of scope for this optimisation).
+    Returns the submodule, or None if the model does not match the expected
+    BERT-style structure.
     """
     try:
         base = getattr(model, model.base_model_prefix)
@@ -95,37 +91,22 @@ def _find_last_self_attention_module(model):
 
 def _enable_last_layer_only_eager(model) -> bool:
     """
-    Make ONLY the final transformer layer compute (and expose) real
-    attention weights, while every other layer keeps running the fast
-    default attention path (SDPA) the model was loaded with.
-
-    Why this differs from the old (Bug #8) approach:
-        Passing `output_attentions=True` to `from_pretrained()` or to a
-        `model(**inputs, output_attentions=True)` call flows the SAME flag
-        down to EVERY layer uniformly, so every layer pays the eager cost.
-        NIS only ever reads the last layer's attention (Section III-C of
-        the paper / `outputs.attentions[-1]` everywhere in this file), so
-        five of those six eager computations were pure waste.
+    Make only the final transformer layer compute and expose real attention
+    weights, while every other layer keeps the fast default attention path.
 
     How it works:
-        1. Give the last layer's self-attention submodule its OWN private
-           copy of the model config (`copy.copy`, not a reference) with
-           `_attn_implementation` forced to "eager". This is important:
-           HuggingFace passes the SAME config object by reference into
-           every layer at construction time, so mutating the shared
-           config's `_attn_implementation` in place would silently force
-           the ENTIRE model into eager again -- copying first avoids that.
-        2. Register a forward hook directly on that one submodule. A hook
-           captures the module's own return value at the point it is
-           produced, so it works whether or not a wrapping module
-           (e.g. BertLayer) actually propagates the attention weights any
-           further up the call stack -- which varies across
-           `transformers` versions and is not something we want this
-           patch to depend on.
+      1. The last layer's self-attention submodule gets its own private
+         copy of the model config with `_attn_implementation` set to
+         "eager". A copy is required because HuggingFace shares one config
+         object across every layer by reference; mutating it in place
+         would force the whole model into eager mode.
+      2. A forward hook on that submodule captures its returned attention
+         weights directly, independent of whether wrapping modules
+         propagate them any further up the call stack.
 
-    Returns True if the patch was applied (module found, hook registered);
-    False if this model's architecture didn't match what we expected, in
-    which case the caller keeps using the old global-eager loading path.
+    Returns True if the patch was applied; False if this model's
+    architecture did not match what was expected, in which case the caller
+    falls back to loading the model with global eager attention.
     """
     self_attn = _find_last_self_attention_module(model)
     if self_attn is None:
@@ -137,17 +118,10 @@ def _enable_last_layer_only_eager(model) -> bool:
         )
         return False
 
-    # Step 1: private config copy, eager only for this submodule.
     private_config = copy.copy(self_attn.config)
     private_config._attn_implementation = "eager"
     self_attn.config = private_config
 
-    # Step 2: capture hook. `output` is whatever this submodule's forward
-    # returns -- across transformers versions this has always been a tuple
-    # whose second element is the attention-probability tensor when eager
-    # computation actually ran (2-tuple in current transformers; older
-    # versions return a 1-tuple when output_attentions was False and a
-    # 2-tuple when True -- checking length + None-ness covers both).
     def _capture_hook(_module, _args, output):
         if isinstance(output, tuple) and len(output) >= 2 and output[1] is not None:
             _captured_attn["weights"] = output[1]
@@ -158,11 +132,9 @@ def _enable_last_layer_only_eager(model) -> bool:
 
 def _self_test_last_layer_capture(tokenizer, model) -> bool:
     """
-    Run one tiny forward pass (two short strings) to confirm the capture
-    hook actually produces a real, correctly-shaped attention tensor before
-    trusting it for the whole benchmark run. This mirrors the project's
-    existing practice of verifying a speed change leaves outputs correct
-    (see CACD_context_handoff.md, section 6/9) before relying on it.
+    Run one small forward pass to confirm the capture hook produces a
+    real, correctly-shaped attention tensor before trusting it for a full
+    benchmark run.
 
     Returns True if a non-None tensor of shape
     (batch, num_heads, seq_len, seq_len) was captured; False otherwise.
@@ -176,7 +148,7 @@ def _self_test_last_layer_capture(tokenizer, model) -> bool:
         model(**probe)
 
     weights = _captured_attn["weights"]
-    _captured_attn["weights"] = None  # reset so it doesn't leak into real scoring
+    _captured_attn["weights"] = None
 
     if weights is None:
         logger.warning("Last-layer-eager self-test: no attention weights captured.")
@@ -191,18 +163,19 @@ def _self_test_last_layer_capture(tokenizer, model) -> bool:
 
 
 def _load_model_global_eager():
-    """The original loading path: forces eager on every layer. Used as the
-    safety-net fallback when the last-layer-only patch isn't applicable."""
+    """Load the model with attention output enabled on every layer.
+    Used as the fallback when the last-layer-only patch is not applicable."""
     tokenizer = AutoTokenizer.from_pretrained(CACD_CROSS_ENCODER_MODEL)
     model     = AutoModelForSequenceClassification.from_pretrained(
         CACD_CROSS_ENCODER_MODEL,
-        output_attentions=True,   # attention matrix required, not just logits
+        output_attentions=True,
     )
     return tokenizer, model
 
 
 def get_cross_encoder():
-    """Lazy-load cross-encoder model and tokenizer (pretrained, no fine-tuning)."""
+    """Lazy-load the cross-encoder model and tokenizer (pretrained, no
+    fine-tuning). Returns (tokenizer, model)."""
     global _tokenizer, _model, _last_layer_capture_active
     if _model is not None:
         return _tokenizer, _model
@@ -214,9 +187,6 @@ def get_cross_encoder():
         _last_layer_capture_active = False
         logger.info("Cross-encoder loaded on %s (global eager, flag disabled)", DEVICE)
     else:
-        # Fast path: load with the model's default attn_implementation
-        # (SDPA where available) and NO global output_attentions request,
-        # so every layer starts on the fast path.
         tokenizer = AutoTokenizer.from_pretrained(CACD_CROSS_ENCODER_MODEL)
         model     = AutoModelForSequenceClassification.from_pretrained(
             CACD_CROSS_ENCODER_MODEL,
@@ -237,10 +207,10 @@ def get_cross_encoder():
         else:
             logger.warning(
                 "Last-layer-only eager patch failed self-test; "
-                "falling back to global eager loading (slower but known-good)."
+                "falling back to global eager loading."
             )
             _tokenizer, _model = _load_model_global_eager()
-            _tokenizer_dev = _model.to(DEVICE)
+            _model.to(DEVICE)
             _model.eval()
             _last_layer_capture_active = False
             logger.info("Cross-encoder loaded on %s (global eager, fallback)", DEVICE)
@@ -253,18 +223,11 @@ def _last_layer_attention(outputs, batch_i: int | None = None) -> torch.Tensor:
     Retrieve the final layer's attention matrix for the just-completed
     forward pass, regardless of which loading path is active.
 
-    - Last-layer-only-eager mode: read from the hook capture box (shape
-      (batch, num_heads, seq, seq)), then clear it so a forward pass that
-      for any reason produces no hook call (shouldn't happen, but defensive)
-      can't accidentally leak a stale tensor into the next call's results.
-    - Legacy global-eager mode: read outputs.attentions[-1] as before.
-
     Args:
         outputs : the model's forward-pass output object.
-        batch_i : if given, index into the batch dimension and return a
-                  single (num_heads, seq, seq) tensor for that item;
-                  if None, return the full (batch, num_heads, seq, seq)
-                  tensor as-is.
+        batch_i : if given, return a single (num_heads, seq, seq) tensor
+                  for that batch index; if None, return the full
+                  (batch, num_heads, seq, seq) tensor.
     """
     if _last_layer_capture_active:
         weights = _captured_attn["weights"]
@@ -272,10 +235,7 @@ def _last_layer_attention(outputs, batch_i: int | None = None) -> torch.Tensor:
         if weights is None:
             raise RuntimeError(
                 "Last-layer-eager capture is active but no attention "
-                "weights were captured for this forward pass -- this "
-                "should not happen after a passing self-test; check for "
-                "a code path that bypasses get_cross_encoder()'s model "
-                "instance (e.g. a second model loaded separately)."
+                "weights were captured for this forward pass."
             )
     else:
         weights = outputs.attentions[-1]
@@ -291,10 +251,9 @@ def _max_alignment_coverage(
     """
     Compute max-alignment coverage from the attention matrix (BERTScore-style).
 
-    For the last attention layer averaged across heads:
-      coverage(A => B) = mean over tokens in A of the maximum attention weight
-                         that token assigns to any token in B.
-      coverage(B => A) = same, in the opposite direction.
+    coverage(A=>B) = mean over tokens in A of the maximum attention weight
+                     that token assigns to any token in B.
+    coverage(B=>A) = same, in the opposite direction.
 
     Args:
         attn    : attention matrix (n_tokens, n_tokens), heads already averaged.
@@ -304,18 +263,15 @@ def _max_alignment_coverage(
     Returns:
         (coverage_a_to_b, coverage_b_to_a)
     """
-    # Region A: tokens 1..sep_idx-1 (excluding [CLS] at position 0)
-    # Region B: tokens sep_idx+1..n_tokens-2 (excluding final [SEP])
     a_range = slice(1, sep_idx)
     b_range = slice(sep_idx + 1, n_tokens - 1)
 
-    sub_a_to_b = attn[a_range, b_range]   # (len_A, len_B)
-    sub_b_to_a = attn[b_range, a_range]   # (len_B, len_A)
+    sub_a_to_b = attn[a_range, b_range]
+    sub_b_to_a = attn[b_range, a_range]
 
     if sub_a_to_b.numel() == 0 or sub_b_to_a.numel() == 0:
         return 0.0, 0.0
 
-    # Each token in A finds its best-matching token in B (max over B dimension), then average
     coverage_a_to_b = sub_a_to_b.max(dim=1).values.mean().item()
     coverage_b_to_a = sub_b_to_a.max(dim=1).values.mean().item()
 
@@ -328,31 +284,13 @@ def _novel_information_score(
     n_tokens: int,
 ) -> float:
     """
-    Novel Information Score (NIS) — measures how much new information B
-    carries relative to A, based on the entropy of the attention B => A.
-
-    Theoretical basis (Information Theory):
-      attention B=>A[j, :] is a probability distribution over tokens in A,
-      representing how much token j in B relies on tokens in A for context.
-
-      Low entropy of attention B=>A[j]:
-        token j focuses on 1-2 specific tokens in A
-        => A can "explain" token j
-        => token j carries little new information.
-
-      High entropy of attention B=>A[j]:
-        token j spreads attention uniformly across A
-        => no token in A can explain token j
-        => token j likely carries new information.
+    Novel Information Score (NIS): how much new information B carries
+    relative to A, based on the entropy of the attention B=>A.
 
     Formula:
-      1. Re-normalise sub_B=>A row-wise (removes softmax dilution from full sequence).
-      2. H(j) = -sum_i p(i|j) * log(p(i|j))   per token j in B.
-      3. NIS = mean(H(j)) / log(|A|)            normalised to [0, 1].
-
-    Normalisation uses log(|A|) — the theoretical maximum entropy when token B
-    spreads uniformly across all tokens in A. This is a natural scale from
-    Information Theory, not a hand-picked constant.
+      1. Re-normalize the B=>A attention sub-matrix row-wise.
+      2. H(j) = -sum_i p(i|j) * log(p(i|j)) per token j in B.
+      3. NIS = mean(H(j)) / log(|A|), clipped to [0, 1].
 
     Args:
         attn    : attention matrix (n_tokens, n_tokens), heads already averaged.
@@ -360,32 +298,25 @@ def _novel_information_score(
         n_tokens: total number of real tokens.
 
     Returns:
-        nis: float in [0, 1].
-             NIS => 0: B is fully explained by A => DROP candidate.
-             NIS => 1: B is entirely novel relative to A => KEEP.
+        nis: float in [0, 1]. Near 0 means B is fully explained by A
+             (redundant); near 1 means B is largely novel relative to A.
     """
     a_range = slice(1, sep_idx)
     b_range = slice(sep_idx + 1, n_tokens - 1)
 
-    sub_b_to_a = attn[b_range, a_range]   # (len_B, len_A)
+    sub_b_to_a = attn[b_range, a_range]
 
     if sub_b_to_a.numel() == 0:
-        return 1.0   # nothing to compare => treat B as entirely novel
+        return 1.0
 
     len_a = sub_b_to_a.shape[1]
     if len_a < 2:
         return 1.0
 
-    # Re-normalise attention B=>A over the A region only
-    # (removes softmax dilution caused by attending to the full sequence)
     row_sums    = sub_b_to_a.sum(dim=1, keepdim=True).clamp(min=1e-9)
-    prob_b_to_a = sub_b_to_a / row_sums   # (len_B, len_A), each row sums to 1
+    prob_b_to_a = sub_b_to_a / row_sums
 
-    # Entropy per token in B:  H(j) = -sum_i p(i|j) * log(p(i|j))
-    ent_per_token = -(prob_b_to_a * torch.log(prob_b_to_a + 1e-9)).sum(dim=1)  # (len_B,)
-
-    # Theoretical maximum entropy = log(len_A)
-    # (achieved when token B spreads uniformly across all tokens in A)
+    ent_per_token = -(prob_b_to_a * torch.log(prob_b_to_a + 1e-9)).sum(dim=1)
     max_ent = float(np.log(len_a))
 
     if max_ent < 1e-9:
@@ -405,12 +336,12 @@ def score_pair(text_a: str, text_b: str) -> dict:
         text_b : candidate chunk already in the index (B).
 
     Returns dict:
-        raw_logit       : float  -- raw cross-encoder output
-        prob_duplicate  : float  -- sigmoid(logit) for binary models;
-                                    softmax[-1] for multi-class models
-        coverage_a_to_b : float  -- fraction of A's content covered by B
-        coverage_b_to_a : float  -- fraction of B's content covered by A
-        nis_b_given_a   : float  -- Novel Information Score of B given A
+        raw_logit       : float -- raw cross-encoder output
+        prob_duplicate  : float -- sigmoid(logit) for binary models,
+                                   softmax[-1] for multi-class models
+        coverage_a_to_b : float -- fraction of A's content covered by B
+        coverage_b_to_a : float -- fraction of B's content covered by A
+        nis_b_given_a   : float -- Novel Information Score of B given A
     """
     tokenizer, model = get_cross_encoder()
 
@@ -425,23 +356,18 @@ def score_pair(text_a: str, text_b: str) -> dict:
     with _autocast_ctx():
         outputs = model(**inputs)
 
-    # Handle both binary models (scalar logit) and multi-class models (e.g. NLI 3-class)
     logits = outputs.logits.squeeze()
     if logits.dim() == 0:
         raw_logit = logits.item()
         prob_dup  = float(torch.sigmoid(logits).item())
     else:
-        # Last class is typically entailment / match / duplicate
         raw_logit = logits[-1].item()
         prob_dup  = float(torch.softmax(logits, dim=-1)[-1].item())
 
-    # Last attention layer averaged across all heads.
-    # The last layer carries the strongest semantic signal for the classification head.
-    last_layer_attn = _last_layer_attention(outputs, batch_i=0)  # (num_heads, seq, seq)
-    avg_attn        = last_layer_attn.mean(dim=0)                # (seq, seq)
+    last_layer_attn = _last_layer_attention(outputs, batch_i=0)
+    avg_attn        = last_layer_attn.mean(dim=0)
 
     input_ids = inputs["input_ids"][0]
-    tokens    = tokenizer.convert_ids_to_tokens(input_ids)
     n_tokens  = int(inputs["attention_mask"][0].sum().item())
 
     sep_token_id  = tokenizer.sep_token_id
@@ -457,14 +383,6 @@ def score_pair(text_a: str, text_b: str) -> dict:
         "coverage_a_to_b":  round(cov_a_to_b, 4),
         "coverage_b_to_a":  round(cov_b_to_a, 4),
         "nis_b_given_a":    nis,
-        # attention_matrix and token lists disabled — heatmap off, avoids
-        # serialising large numpy arrays during benchmarking.
-        # Uncomment for visual analysis:
-        # "attention_matrix": avg_attn[:n_tokens, :n_tokens].cpu().numpy(),
-        # "tokens_a":         tokens[1:sep_idx],
-        # "tokens_b":         tokens[sep_idx + 1:n_tokens - 1],
-        # "sep_idx":          sep_idx,
-        # "n_tokens":         n_tokens,
     }
 
 
@@ -476,24 +394,14 @@ def score_candidates_batched(
     chunk_level: str | None = None,
 ) -> list[dict]:
     """
-    Batch version of score_candidates — tokenises all K candidates together
-    and runs a single forward pass instead of K sequential passes.
-
-    On GPU a single batched forward pass utilises parallelism far better than
-    K sequential calls; expected speedup ~3-4x for K=5.
-
-    Handles:
-      - Stripping the contextual header before scoring.
-      - Skipping parent-child pairs (no forward pass for those).
-      - Computing NIS from the per-pair attention sub-matrix
-        (attention is not shared across pairs, so per-pair extraction
-        still runs inside the loop, but the GPU kernel is batched).
+    Batch-scores one new chunk against all of its candidates in a single
+    forward pass instead of one pass per candidate.
 
     Input:
         chunk_text     : text of the new chunk (A).
         candidates     : list of candidate dicts from Stage 1.
-        chunk_parent_id: parent_id of the new chunk (for HPC guard).
-        chunk_level    : level field of the new chunk (for HPC guard).
+        chunk_parent_id: parent_id of the new chunk (parent-child guard).
+        chunk_level    : level field of the new chunk (parent-child guard).
 
     Returns:
         list of candidate dicts, each extended with scoring fields
@@ -502,7 +410,7 @@ def score_candidates_batched(
     tokenizer, model = get_cross_encoder()
     text_a_clean = _strip_contextual_header(chunk_text)
 
-    to_score: list[tuple[int, dict]] = []   # (original_idx, candidate)
+    to_score: list[tuple[int, dict]] = []
     results:  list[dict]             = []
 
     for i, cand in enumerate(candidates):
@@ -522,12 +430,11 @@ def score_candidates_batched(
             })
         else:
             to_score.append((i, cand))
-            results.append(None)   # placeholder
+            results.append(None)
 
     if not to_score:
         return results
 
-    # Tokenise all pairs at once — single batch
     texts_b = [_strip_contextual_header(cand["text"]) for _, cand in to_score]
     texts_a  = [text_a_clean] * len(texts_b)
 
@@ -536,15 +443,14 @@ def score_candidates_batched(
         return_tensors="pt",
         truncation=True,
         max_length=256,
-        padding=True,   # pad to the same length within the batch
+        padding=True,
     ).to(DEVICE)
 
-    outputs = None
     with _autocast_ctx():
         outputs = model(**inputs)
 
-    logits_batch = outputs.logits  # (batch, num_labels)
-    attentions_last = _last_layer_attention(outputs)  # (batch, num_heads, seq, seq)
+    logits_batch = outputs.logits
+    attentions_last = _last_layer_attention(outputs)
 
     for batch_i, (orig_i, cand) in enumerate(to_score):
         logits = logits_batch[batch_i]
@@ -555,7 +461,7 @@ def score_candidates_batched(
             prob_dup  = float(torch.softmax(logits, dim=-1)[-1].item())
             raw_logit = logits[-1].item()
 
-        avg_attn = attentions_last[batch_i].mean(dim=0)  # (seq, seq)
+        avg_attn = attentions_last[batch_i].mean(dim=0)
 
         input_ids = inputs["input_ids"][batch_i]
         n_tokens  = int(inputs["attention_mask"][batch_i].sum().item())
@@ -581,119 +487,26 @@ def score_candidates_batched(
 
 
 @torch.no_grad()
-def score_sentences_batched(candidate_text: str, sentences: list[str]) -> list[dict]:
-    """
-    Batch version of the per-sentence scoring used by sentence-level merge —
-    tokenises one candidate against ALL of A's sentences together and runs a
-    single forward pass, instead of one forward pass per sentence.
-
-    This mirrors score_candidates_batched but with the roles reversed: there,
-    one new chunk is fixed as text_a and many candidates vary as text_b; here,
-    one candidate is fixed as text_a (playing the "known context" role for
-    NIS, exactly as in the single-pair call this replaces:
-    score_pair(candidate_text, sentence)) and A's sentences vary as text_b.
-    Looping over the (few, same-document) candidates and batching over
-    sentences inside each iteration turns m*k single-pair forward passes
-    into k batched ones, with identical outputs (same tokenisation, same
-    model, same math — only the batching changes).
-
-    Input:
-        candidate_text : text of one same-document candidate B_j (the "A"
-                          role for NIS purposes, matching score_pair's usage
-                          in the merge step: score_pair(cand["text"], sent)).
-        sentences      : list of A's sentences (the "B" role), scored all
-                          at once against candidate_text.
-
-    Returns:
-        list of dicts, one per sentence, in the same order as `sentences`,
-        each with the same fields as score_pair (raw_logit, prob_duplicate,
-        coverage_a_to_b, coverage_b_to_a, nis_b_given_a).
-    """
-    if not sentences:
-        return []
-
-    tokenizer, model = get_cross_encoder()
-
-    texts_a = [candidate_text] * len(sentences)
-    texts_b = list(sentences)
-
-    inputs = tokenizer(
-        texts_a, texts_b,
-        return_tensors="pt",
-        truncation=True,
-        max_length=256,
-        padding=True,
-    ).to(DEVICE)
-
-    with _autocast_ctx():
-        outputs = model(**inputs)
-
-    logits_batch = outputs.logits  # (batch, num_labels)
-    attentions_last = _last_layer_attention(outputs)  # (batch, num_heads, seq, seq)
-
-    results = []
-    for batch_i in range(len(sentences)):
-        logits = logits_batch[batch_i]
-        if logits.dim() == 0 or logits.shape[0] == 1:
-            prob_dup  = float(torch.sigmoid(logits.squeeze()).item())
-            raw_logit = logits.squeeze().item()
-        else:
-            prob_dup  = float(torch.softmax(logits, dim=-1)[-1].item())
-            raw_logit = logits[-1].item()
-
-        avg_attn = attentions_last[batch_i].mean(dim=0)  # (seq, seq)
-
-        input_ids = inputs["input_ids"][batch_i]
-        n_tokens  = int(inputs["attention_mask"][batch_i].sum().item())
-        sep_id    = tokenizer.sep_token_id
-        sep_pos   = (input_ids == sep_id).nonzero(as_tuple=True)[0]
-        sep_idx   = int(sep_pos[0].item()) if len(sep_pos) > 0 else n_tokens // 2
-
-        cov_a2b, cov_b2a = _max_alignment_coverage(avg_attn, sep_idx, n_tokens)
-        nis = _novel_information_score(avg_attn, sep_idx, n_tokens)
-
-        results.append({
-            "raw_logit":        round(raw_logit, 4),
-            "prob_duplicate":   round(prob_dup, 4),
-            "coverage_a_to_b":  round(cov_a2b, 4),
-            "coverage_b_to_a":  round(cov_b2a, 4),
-            "nis_b_given_a":    nis,
-        })
-
-    return results
-
-
-@torch.no_grad()
 def score_pairs_batched(
     pairs: list[tuple[str, str]],
     sub_batch_size: int = 128,
 ) -> list[dict]:
     """
-    Fully general batched scoring: unlike score_candidates_batched (one A,
-    many B) or score_sentences_batched (one A per call, many B), here BOTH
-    text_a and text_b vary independently per pair. This is what lets Stage 2
-    batch across MULTIPLE new chunks at once (each chunk = a different A,
-    each with its own K candidates = different B's), instead of one forward
-    pass per chunk.
+    General batched scoring where both text_a and text_b vary independently
+    per pair. This lets Stage 3 batch across multiple new chunks at once
+    (each with its own K candidates) instead of one forward pass per chunk.
 
-    Internally chunks the pair list into sub-batches of `sub_batch_size` to
-    bound peak memory (attention tensors are O(batch x heads x seq x seq));
-    each sub-batch is still a single forward pass, so this is still k
-    forward passes total for k = ceil(len(pairs)/sub_batch_size), not one
-    pair at a time.
-
-    Callers are responsible for any guard filtering (parent-child skip,
-    header stripping) before building `pairs` — this function does no
-    guarding of its own, matching score_sentences_batched's contract.
+    Splits `pairs` into sub-batches of `sub_batch_size` to bound peak
+    memory. Callers are responsible for any guard filtering (parent-child
+    skip, header stripping) before building `pairs`.
 
     Input:
         pairs          : list of (text_a, text_b) tuples.
-        sub_batch_size : max pairs per forward pass (memory safety valve).
+        sub_batch_size : max pairs per forward pass.
 
     Returns:
         list of dicts, one per pair, in the same order as `pairs`, each
-        with the same fields as score_pair (raw_logit, prob_duplicate,
-        coverage_a_to_b, coverage_b_to_a, nis_b_given_a).
+        with the same fields as score_pair.
     """
     if not pairs:
         return []
@@ -757,10 +570,8 @@ def score_candidates(
     chunk_parent_id: str | None = None,
     chunk_level: str | None = None,
 ) -> list[dict]:
-    """
-    Wrapper around score_candidates_batched.
-    Preserves the original interface so stage3_decision.py requires no changes.
-    """
+    """Thin wrapper around score_candidates_batched, kept for interface
+    compatibility with callers that predate the batched implementation."""
     return score_candidates_batched(
         chunk_text, candidates, chunk_parent_id, chunk_level,
     )
@@ -771,14 +582,10 @@ import re as _re
 
 def _strip_contextual_header(text: str) -> str:
     """
-    Remove the [Context: ... ] header prepended by the Contextual chunker.
-
-    Example:
-      "[Context: Super Bowl 50 | Part 3/12] The game was..." => "The game was..."
-
-    If no header is present, returns the text unchanged.
-    The original text stored in Qdrant is NOT modified — stripping happens
-    only before scoring to prevent false redundancy from identical headers.
+    Remove a "[Context: ...]" header prepended by the Contextual chunker,
+    e.g. "[Context: Super Bowl 50 | Part 3/12] The game was..." becomes
+    "The game was...". Returns the text unchanged if no header is present.
+    Stripping happens only before scoring; the stored text is untouched.
     """
     return _re.sub(r'^\[Context:[^\]]*\]\s*', '', text).strip()
 
@@ -792,25 +599,15 @@ def _is_parent_child_pair(
 ) -> bool:
     """
     Return True if the new chunk and the candidate form a parent-child pair
-    in HierarchicalParentChild chunking.
+    under HierarchicalParentChild chunking, in which case they must be
+    excluded from scoring (they overlap by design, not by duplication).
 
-    Parent-child pairs overlap by design, not because of genuine content
-    duplication, and must not be compared by the dedup scorer.
-
-    Cases that trigger a skip:
-      1. New chunk is a child whose parent is the candidate:
-         chunk_parent_id == cand_chunk_id
-      2. New chunk is a parent and the candidate is one of its children:
-         chunk_level == "parent" and cand_parent_id is set
-      3. Both are sibling children of the same parent:
-         => NOT skipped; siblings may genuinely duplicate each other
-            (small chunk_size + overlap) and should be processed normally.
+    Sibling children of the same parent are NOT excluded; they may
+    genuinely duplicate each other and are scored normally.
     """
-    # Case 1: new chunk is a child; candidate is its parent
     if chunk_parent_id and chunk_parent_id == cand_chunk_id:
         return True
 
-    # Case 2: new chunk is a parent; candidate is one of its children
     if chunk_level == "parent" and cand_parent_id:
         if cand_parent_id.startswith(chunk_parent_id or "___NOMATCH___"):
             return True

@@ -12,72 +12,13 @@ Formula (Elkan, 2001 — binary classification with asymmetric costs):
 
 With symmetric costs (cost_FP = cost_FN = 1.0) => cutoff = 0.5, which coincides
 with the natural sigmoid threshold of the cross-encoder model.
-
-Note on RunningLogitCalibrator (retained for reference):
-  The z-score online calibrator was the original Stage 3 signal before NIS was
-  introduced. It is no longer used in the active decision path but is kept here
-  for comparison experiments.
 """
 
 from __future__ import annotations
 
 import logging
 
-import numpy as np
-
 logger = logging.getLogger(__name__)
-
-
-class RunningLogitCalibrator:
-    """
-    Online (streaming) calibrator that converts a raw redundancy signal into
-    a relative probability P(duplicate) using z-score normalisation + sigmoid.
-
-    Input : redundancy_signal = min(coverage_a_to_b, coverage_b_to_a)
-    Output: float in [0, 1] — probability that the pair is a duplicate,
-            relative to the distribution of signals seen so far.
-
-    Formula:
-        z     = (signal - mean(observed)) / std(observed)
-        P_dup = sigmoid(z) = 1 / (1 + exp(-z))
-
-    This replaces a fixed absolute threshold with a distribution-relative
-    comparison: a pair is flagged only when its signal is in the high tail
-    of the observed distribution, regardless of domain-level scale shifts.
-    """
-
-    def __init__(self, min_samples: int = 30):
-        self.min_samples = min_samples
-        self._signals: list[float] = []
-
-    def update(self, signal: float) -> None:
-        self._signals.append(signal)
-
-    def calibrated_probability(self, signal: float) -> float:
-        """
-        P(duplicate) = sigmoid(z-score(signal)).
-
-        Returns 0.0 when fewer than 2 samples have been observed
-        (neutral, biased toward KEEP to avoid premature drops).
-        """
-        if len(self._signals) < 2:
-            return 0.0
-
-        arr  = np.array(self._signals)
-        mean = arr.mean()
-        std  = arr.std() + 1e-6
-        z    = (signal - mean) / std
-        return float(1.0 / (1.0 + np.exp(-z)))
-
-    def stats(self) -> dict:
-        if not self._signals:
-            return {"n": 0, "mean": 0.0, "std": 0.0}
-        arr = np.array(self._signals)
-        return {
-            "n":    len(arr),
-            "mean": round(float(arr.mean()), 4),
-            "std":  round(float(arr.std()), 4),
-        }
 
 
 def bayes_optimal_cutoff(cost_false_positive: float, cost_false_negative: float) -> float:
