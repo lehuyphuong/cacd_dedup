@@ -3,22 +3,22 @@ scripts/experiment_nis_vs_similarity.py
 
 Standalone experiment: compares CACD's New Information Score (NIS) against
 plain cosine similarity (the Similarity baseline's signal) across a
-controlled gradient of shared content, from 100% down to 50% overlap in
-5% steps.
+controlled gradient of SEMANTIC overlap, from 100% down to 50% in 5% steps.
 
-Why this experiment exists: a good redundancy signal should track the
-true amount of shared content smoothly and predictably as two chunks
-drift apart, rather than saturating near a constant value or dropping
-too sharply. This script builds chunk pairs with an exact, known overlap
-percentage and reports both signals side by side, so the two can be
-compared directly against the same ground truth.
+Why semantic overlap, not verbatim overlap: the central claim this paper
+makes about pooled-vector similarity is that it can be misled once wording
+changes, even when meaning does not. A verbatim-overlap test (sharing exact
+sentences) does not probe that claim; a paraphrase-overlap test does. Chunk
+B here is built from genuine paraphrases of chunk A's content, not copies
+of it, so at 100% "overlap" the two chunks share no guaranteed literal
+wording at all, only meaning.
 
-How overlap is controlled: chunk A is always the same 20-sentence
-passage. Chunk B keeps the first N sentences of chunk A verbatim and
-replaces the remaining (20 - N) sentences with sentences from an
-unrelated passage, so chunk A and chunk B share exactly N/20 = the
-target overlap percentage of their content by construction, not by
-estimation.
+How overlap is controlled: chunk A is always the same 20-sentence passage.
+Chunk B keeps a paraphrased version of the first N sentences of chunk A
+(same meaning, different wording and sentence structure) and replaces the
+remaining (20 - N) sentences with sentences from an unrelated passage, so
+chunk A and chunk B share exactly N/20 = the target overlap percentage of
+their content by construction, not by estimation.
 
 No dependency on the benchmark pipeline -- only requires:
   pip install transformers sentence-transformers torch numpy
@@ -48,75 +48,102 @@ OVERLAP_LEVELS = list(range(100, 45, -5))
 # duplicates at each overlap level.
 SIMILARITY_THRESHOLD = 0.8
 
-# ── Controlled-overlap chunk pairs ──────────────────────────────────────────
+# ── Controlled-overlap chunk pairs (semantic, not verbatim) ────────────────
 
 # Chunk A is always the concatenation of all 20 sentences below.
 BASE_FACTS = [
-    "The Eiffel Tower is located in Paris, France.",
-    "It was designed by the engineer Gustave Eiffel.",
-    "Construction began in January 1887.",
-    "The tower was completed in March 1889.",
-    "It was built for the 1889 World's Fair.",
-    "The tower stands 330 meters tall.",
-    "It was the tallest man-made structure until 1930.",
-    "The structure is made of wrought iron.",
-    "It weighs approximately 10,100 tons.",
-    "The tower has three visitor levels.",
-    "Around seven million people visit it each year.",
-    "It is one of the most recognizable landmarks in the world.",
-    "The tower is repainted every seven years.",
-    "It uses about 60 tons of paint per repainting.",
-    "The tower sways slightly in strong wind.",
-    "It was originally intended as a temporary structure.",
-    "The tower has 108 stories.",
-    "Its base is a square measuring 125 meters per side.",
-    "The tower is illuminated by 20,000 light bulbs at night.",
-    "It remains a global symbol of France.",
+    "The Eiffel Tower, an iconic iron lattice structure, stands prominently on the Champ de Mars in central Paris, France.",
+    "French engineer Gustave Eiffel and his company were responsible for designing and constructing this famous landmark.",
+    "Work on the tower's foundations and ironwork officially commenced in January of 1887, following years of planning.",
+    "After more than two years of construction, the tower was finally completed and opened in March 1889.",
+    "The structure was originally built to serve as the entrance arch for the 1889 World's Fair, held in Paris.",
+    "Rising to a height of approximately 330 meters, the tower was an extraordinary engineering achievement for its era.",
+    "For over four decades, until 1930, it held the record as the tallest man-made structure anywhere in the world.",
+    "The entire framework of the tower is constructed from puddled wrought iron, chosen for its strength and relative lightness.",
+    "In total, the finished structure weighs approximately ten thousand one hundred metric tons, excluding non-structural elements.",
+    "Visitors can access the tower via three distinct public levels, each offering different views of the surrounding city.",
+    "Each year, the tower draws roughly seven million visitors from around the world, making it a major tourist destination.",
+    "It is widely regarded as one of the most instantly recognizable landmarks anywhere on the planet.",
+    "To protect it from corrosion, the tower undergoes a fresh coat of paint approximately once every seven years.",
+    "A single repainting effort requires roughly sixty tons of specially formulated paint applied by hand.",
+    "During periods of strong wind, the upper sections of the tower can sway slightly from side to side.",
+    "Interestingly, the structure was originally intended to be a temporary installation, dismantled after twenty years.",
+    "The tower's iron framework comprises what is often described as 108 stories when counted architecturally.",
+    "At its base, the structure forms a square measuring approximately 125 meters along each side.",
+    "After dark, the tower is illuminated by roughly twenty thousand individual light bulbs, creating a sparkling effect.",
+    "Today, the tower endures as an enduring global symbol representing France and its cultural heritage.",
 ]
 
-# Unrelated sentences used to replace BASE_FACTS sentences in chunk B as
-# the target overlap decreases, keeping chunk length roughly constant so
+# Genuine paraphrases of BASE_FACTS, same order, same meaning, deliberately
+# different wording and sentence structure -- this is the "semantic overlap"
+# content used to build chunk B, never a copy of BASE_FACTS.
+PARAPHRASED_FACTS = [
+    "Standing tall in the heart of Paris on the Champ de Mars, the Eiffel Tower is a well-known lattice-work iron landmark.",
+    "The landmark's design and construction were carried out by the French engineering firm led by Gustave Eiffel.",
+    "Building work on the tower's base and metal frame began at the start of 1887, after extensive preparation.",
+    "It took over two years to build, and the tower opened to the public in March of 1889.",
+    "Originally, the tower served as a grand gateway for visitors attending the World's Fair hosted in Paris in 1889.",
+    "Reaching roughly 330 meters into the sky, the tower represented a remarkable feat of engineering at the time.",
+    "The tower remained the world's tallest man-made structure for more than 40 years, losing that title only in 1930.",
+    "Wrought iron, valued for being both sturdy and comparatively light, was used throughout the tower's entire framework.",
+    "Not counting smaller add-ons, the completed tower has a total weight of around 10,100 metric tons.",
+    "The tower offers three separate levels open to the public, each providing a unique vantage point over Paris.",
+    "About seven million tourists travel to see the tower annually, making it one of the world's top attractions.",
+    "Few structures anywhere are as instantly identifiable as this landmark, which is famous the world over.",
+    "Roughly every seven years, workers repaint the entire tower to keep it from rusting.",
+    "Each repainting job uses close to sixty tons of paint, applied entirely by hand.",
+    "When winds are strong, the tower's upper portion has been known to sway noticeably from one side to the other.",
+    "Originally, engineers planned for the tower to stand for only two decades before being taken down.",
+    "Architecturally speaking, the tower's iron structure is often said to contain 108 individual stories.",
+    "The tower's foundation forms a square shape, with each side stretching about 125 meters.",
+    "At night, around twenty thousand light bulbs illuminate the tower, giving it a shimmering appearance.",
+    "The tower continues to stand today as a lasting emblem of French culture and identity.",
+]
+
+# Unrelated sentences used to replace PARAPHRASED_FACTS sentences in chunk B
+# as the target overlap decreases, keeping chunk length roughly constant so
 # overlap percentage is not confounded with chunk length.
 DISTRACTOR_FACTS = [
-    "The Amazon rainforest covers much of northwestern Brazil.",
-    "It extends into Peru, Colombia, and other South American countries.",
-    "The forest spans roughly 5.5 million square kilometers.",
-    "It is the largest tropical rainforest on Earth.",
-    "The Amazon River flows through the forest.",
-    "The river discharges more water than any other river.",
-    "The rainforest is home to millions of species.",
-    "It contains about 10 percent of the world's known species.",
-    "Many indigenous communities live within the forest.",
-    "The forest plays a major role in regulating global climate.",
-    "It produces roughly 20 percent of the world's oxygen.",
-    "Deforestation threatens large areas of the rainforest each year.",
-    "Logging and agriculture are major causes of forest loss.",
-    "The canopy can reach heights of over 40 meters.",
-    "Rainfall in the region can exceed 2,000 millimeters annually.",
-    "The forest supports thousands of bird species.",
-    "It is also home to jaguars, sloths, and river dolphins.",
-    "Scientists continue to discover new species there.",
-    "Conservation efforts aim to protect remaining forest areas.",
-    "The Amazon is often called the lungs of the planet.",
+    "The Amazon rainforest stretches across a vast portion of northwestern Brazil, forming one of the planet's largest ecosystems.",
+    "Beyond Brazil, the forest also extends into neighboring countries including Peru, Colombia, and several other South American nations.",
+    "In total, the rainforest covers an area of roughly 5.5 million square kilometers of dense tropical vegetation.",
+    "It is widely recognized as the largest tropical rainforest anywhere on Earth, unmatched in scale.",
+    "The mighty Amazon River winds its way through the heart of the forest, feeding countless tributaries along the way.",
+    "By volume, the Amazon River discharges more freshwater into the ocean than any other river system on the planet.",
+    "Millions of distinct plant, animal, and insect species make their home within the boundaries of this rainforest.",
+    "Scientists estimate the forest contains roughly ten percent of all species currently known to science.",
+    "Numerous indigenous communities have lived within the rainforest for generations, relying on it for their way of life.",
+    "The forest plays an outsized role in regulating weather patterns and climate conditions across the globe.",
+    "Through photosynthesis, the rainforest is responsible for producing close to twenty percent of the world's oxygen supply.",
+    "Each year, significant portions of the rainforest are lost to deforestation driven by human activity.",
+    "The primary drivers behind this forest loss are commercial logging operations and large-scale agricultural expansion.",
+    "In some areas, the forest canopy rises to heights exceeding forty meters above the ground.",
+    "Certain regions of the rainforest receive more than two thousand millimeters of rainfall over the course of a year.",
+    "The forest is also an important habitat for thousands of distinct bird species found nowhere else.",
+    "Iconic animals such as jaguars, sloths, and river dolphins all make their home within this ecosystem.",
+    "Researchers continue to identify previously unknown species living within the depths of the rainforest.",
+    "Numerous conservation initiatives have been launched in an effort to preserve what remains of the forest.",
+    "Because of its role in producing oxygen, the Amazon is frequently referred to as the lungs of the planet.",
 ]
 
-assert len(BASE_FACTS) == len(DISTRACTOR_FACTS) == 20, \
-    "Both fact lists must have exactly 20 sentences for clean 5% steps."
+assert len(BASE_FACTS) == len(PARAPHRASED_FACTS) == len(DISTRACTOR_FACTS) == 20, \
+    "All three fact lists must have exactly 20 sentences for clean 5% steps."
 
 
 def build_pair(overlap_pct: int) -> tuple[str, str]:
     """
-    Build one (chunk_a, chunk_b) pair at a target overlap level.
+    Build one (chunk_a, chunk_b) pair at a target semantic-overlap level.
 
-    chunk_a is always the full 20-sentence base passage. chunk_b keeps
-    the first n_keep sentences of chunk_a verbatim and replaces the rest
-    with sentences from an unrelated passage, so the two chunks share
-    exactly overlap_pct percent of their content by construction.
+    chunk_a is always the full 20-sentence base passage. chunk_b keeps a
+    paraphrase (never a copy) of the first n_keep sentences of chunk_a and
+    replaces the rest with sentences from an unrelated passage, so the two
+    chunks share exactly overlap_pct percent of their meaning by
+    construction, with no guaranteed literal wording in common anywhere.
     """
     n_total = len(BASE_FACTS)
     n_keep  = round(n_total * overlap_pct / 100)
     chunk_a = " ".join(BASE_FACTS)
-    chunk_b = " ".join(BASE_FACTS[:n_keep] + DISTRACTOR_FACTS[n_keep:])
+    chunk_b = " ".join(PARAPHRASED_FACTS[:n_keep] + DISTRACTOR_FACTS[n_keep:])
     return chunk_a, chunk_b
 
 
@@ -202,7 +229,7 @@ def compute_cosine_similarity(chunk_a: str, chunk_b: str) -> float:
 
 def main():
     print("=" * 84)
-    print("NIS vs. Cosine Similarity across a controlled content-overlap gradient")
+    print("NIS vs. Cosine Similarity across a controlled semantic-overlap gradient")
     print(f"Cross-encoder: {CROSS_ENCODER_MODEL}")
     print(f"Bi-encoder:    {EMBED_MODEL}")
     print("=" * 84)
@@ -262,6 +289,11 @@ def main():
     print(f"  (1 - NIS)   vs. overlap_pct : r = {r_nis:.4f}")
     print()
     print("Interpretation:")
+    print("  chunk_b is built from paraphrases at every overlap level, never")
+    print("  literal copies, so any lexical overlap between chunk_a and")
+    print("  chunk_b is incidental, not by design. This is the case a pooled")
+    print("  bi-encoder vector is most at risk of misjudging: two chunks can")
+    print("  share little surface wording while still meaning the same thing.")
     print("  Both cosine_sim and (1 - NIS) are read here as redundancy")
     print("  signals on a comparable [0, 1] scale: higher means the two")
     print("  chunks are judged more alike. Since overlap_pct is the exact,")
