@@ -20,15 +20,19 @@ remaining (20 - N) sentences with sentences from an unrelated passage, so
 chunk A and chunk B share exactly N/20 = the target overlap percentage of
 their content by construction, not by estimation.
 
-Sentence length is deliberately kept to roughly 10 words per sentence
-(20 sentences per chunk, ~200 words / ~260 tokens total). An earlier
-version of this script used much longer sentences (~2200 characters,
-~440 tokens per chunk), which silently exceeded the tokenizer's
-max_length and got truncated -- the model never saw the differentiating
-content near the end of chunk_b for most overlap levels, which made NIS
-and cosine_sim come out identical across most of the gradient. This
-script also asserts at runtime that no truncation occurs (see
-_check_no_truncation), so that failure mode cannot silently recur.
+Sentence length: two earlier versions of this script were too long and
+silently exceeded the tokenizer's MAX_LENGTH, truncating away the
+differentiating content near the end of chunk_b for most overlap levels.
+The first fix (raising MAX_LENGTH to 512) was not enough, because the
+initial word-to-token ratio estimate (~1.3 tokens/word) was too low --
+this content's numbers ("10,100", "1889") and proper nouns ("Gustave
+Eiffel") fragment into more subword tokens than ordinary prose. Sentences
+here (~7-8 words each) are sized against the ratio actually measured from
+that run (~1.44 tokens/word), with margin. This script also asserts at
+runtime that no truncation occurs (see _check_no_truncation) so that
+failure mode is reported with the true token count instead of recurring
+silently -- do not trust any result printed alongside a truncation
+warning.
 
 No dependency on the benchmark pipeline -- only requires:
   pip install transformers sentence-transformers torch numpy
@@ -51,10 +55,9 @@ EMBED_MODEL         = "sentence-transformers/all-MiniLM-L6-v2"
 DEVICE               = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Max sequence length for both the cross-encoder pair and the bi-encoder.
-# 512 is the standard BERT-family limit; both models used here are built
-# on that architecture. Kept as a named constant (not a magic number)
-# because _check_no_truncation below needs the same value used at
-# tokenization time.
+# 512 is the hard architectural ceiling for both models here (standard
+# BERT-family position embeddings) -- it cannot be raised further; the
+# fix for exceeding it is to shorten the input text, not raise this value.
 MAX_LENGTH = 512
 
 # Overlap levels to test: 100%, 95%, 90%, ..., 50% (11 levels)
@@ -69,78 +72,78 @@ SIMILARITY_THRESHOLD = 0.8
 
 # Chunk A is always the concatenation of all 20 sentences below.
 BASE_FACTS = [
-    "The Eiffel Tower stands on the Champ de Mars in Paris.",
-    "Engineer Gustave Eiffel designed and built this famous landmark.",
-    "Construction of the tower's foundation began in January 1887.",
-    "The tower was completed and opened to the public in 1889.",
-    "It was built as the entrance for the 1889 World's Fair.",
-    "The tower rises to a height of about 330 meters.",
-    "It was the tallest man-made structure in the world until 1930.",
-    "The entire tower is built from strong, lightweight wrought iron.",
-    "The finished structure weighs roughly ten thousand one hundred tons.",
-    "Visitors can explore the tower across three public levels.",
-    "Around seven million people visit the tower every year.",
-    "It is one of the most recognizable landmarks in the world.",
-    "The tower is repainted with fresh coats roughly every seven years.",
-    "Each repainting uses about sixty tons of specially made paint.",
-    "In strong winds, the top of the tower can sway slightly.",
-    "The tower was originally meant to be a temporary structure.",
-    "The iron framework is often described as having 108 stories.",
-    "The tower base forms a square about 125 meters per side.",
-    "At night, twenty thousand light bulbs illuminate the tower.",
-    "The tower remains a lasting global symbol of France today.",
+    "The Eiffel Tower stands in Paris, France.",
+    "Gustave Eiffel designed and built the tower.",
+    "Construction began in January 1887.",
+    "The tower opened to the public in 1889.",
+    "It was built for the 1889 World's Fair.",
+    "The tower stands about 330 meters tall.",
+    "It was the tallest structure until 1930.",
+    "The tower is made of wrought iron.",
+    "It weighs about ten thousand tons.",
+    "The tower has three public levels.",
+    "Seven million people visit it yearly.",
+    "It is one of the world's most recognizable landmarks.",
+    "The tower is repainted every seven years.",
+    "Repainting uses about sixty tons of paint.",
+    "Strong winds make the tower sway slightly.",
+    "It was originally meant to be temporary.",
+    "The tower has 108 stories architecturally.",
+    "Its base forms a square 125 meters wide.",
+    "Twenty thousand bulbs light it at night.",
+    "It remains a lasting symbol of France.",
 ]
 
 # Genuine paraphrases of BASE_FACTS, same order, same meaning, deliberately
 # different wording and sentence structure -- this is the "semantic overlap"
 # content used to build chunk B, never a copy of BASE_FACTS.
 PARAPHRASED_FACTS = [
-    "Located on the Champ de Mars, the tower rises above central Paris.",
-    "The famous landmark was designed and built by Gustave Eiffel's firm.",
-    "Work on the tower's base and framework started in early 1887.",
-    "After construction, the tower opened its doors to visitors in 1889.",
-    "The tower first served as the entrance to the 1889 World's Fair.",
-    "Standing roughly 330 meters tall, the tower is an engineering marvel.",
-    "For more than 40 years, it was the world's tallest man-made structure.",
-    "Sturdy yet fairly light wrought iron forms the tower's entire frame.",
-    "Not including extras, the tower weighs close to 10,100 metric tons.",
-    "Three distinct levels let visitors take in different views of Paris.",
-    "About seven million tourists come to see the tower each year.",
-    "Hardly any landmark is as instantly recognizable as this one.",
-    "Workers repaint the tower roughly every seven years to prevent rust.",
-    "Around sixty tons of paint go into each full repainting job.",
-    "Strong winds can cause the tower's upper section to sway a bit.",
-    "Engineers originally planned to take the tower down after twenty years.",
-    "The tower's frame is often said to contain 108 individual stories.",
-    "The base of the tower forms a square roughly 125 meters wide.",
-    "Around twenty thousand bulbs light up the tower after sunset.",
-    "Today, the tower still stands as an enduring symbol of France.",
+    "The famous tower is located in Paris.",
+    "The landmark was designed by Gustave Eiffel.",
+    "Building work started at the beginning of 1887.",
+    "The tower welcomed visitors starting in 1889.",
+    "It served as the gateway for the 1889 World's Fair.",
+    "The structure reaches roughly 330 meters high.",
+    "For decades, it was the tallest man-made structure.",
+    "Wrought iron makes up the tower's frame.",
+    "The completed tower weighs around 10,100 tons.",
+    "Visitors can access three separate levels.",
+    "About seven million tourists visit each year.",
+    "Few landmarks are as widely recognized as this one.",
+    "The tower gets repainted roughly every seven years.",
+    "Each repainting takes close to sixty tons of paint.",
+    "The upper tower sways a bit in high wind.",
+    "Engineers originally planned it as a temporary structure.",
+    "The frame is often described as 108 stories.",
+    "The base is shaped like a square, 125 meters wide.",
+    "About twenty thousand bulbs illuminate it nightly.",
+    "It still stands today as a symbol of France.",
 ]
 
 # Unrelated sentences used to replace PARAPHRASED_FACTS sentences in chunk B
 # as the target overlap decreases, keeping chunk length roughly constant so
 # overlap percentage is not confounded with chunk length.
 DISTRACTOR_FACTS = [
-    "The Amazon rainforest covers a huge area of northwestern Brazil.",
-    "The forest also stretches into Peru, Colombia, and nearby countries.",
-    "In total, it spans roughly 5.5 million square kilometers of land.",
-    "It is recognized as the largest tropical rainforest on Earth.",
-    "The Amazon River flows directly through the heart of the forest.",
-    "This river discharges more water than any other river worldwide.",
-    "Millions of plant, animal, and insect species live in this forest.",
-    "The forest holds about ten percent of all known species.",
-    "Many indigenous communities have lived in the forest for generations.",
-    "The rainforest plays a major role in regulating the global climate.",
-    "It produces close to twenty percent of the world's oxygen supply.",
-    "Large areas of the forest are lost to deforestation every year.",
-    "Logging and farming are the main causes of this forest loss.",
-    "In places, the forest canopy rises higher than forty meters.",
-    "Some regions get more than two thousand millimeters of rain yearly.",
-    "The forest is home to thousands of different bird species.",
-    "Jaguars, sloths, and river dolphins all live within this ecosystem.",
-    "Scientists keep discovering new species deep within the rainforest.",
-    "Conservation groups are working hard to protect the remaining forest.",
-    "The Amazon is often called the lungs of our planet.",
+    "The Amazon rainforest covers much of Brazil.",
+    "It also extends into Peru and Colombia.",
+    "The forest spans about 5.5 million square kilometers.",
+    "It is the largest tropical rainforest on Earth.",
+    "The Amazon River flows through the forest.",
+    "It carries more water than any other river.",
+    "Millions of species live within the forest.",
+    "It holds roughly ten percent of known species.",
+    "Indigenous communities have lived there for generations.",
+    "The forest helps regulate the global climate.",
+    "It produces about twenty percent of the world's oxygen.",
+    "Large areas are lost to deforestation yearly.",
+    "Logging and farming drive most forest loss.",
+    "In places, the canopy exceeds forty meters.",
+    "Some regions get over two thousand millimeters of rain.",
+    "The forest hosts thousands of bird species.",
+    "Jaguars, sloths, and river dolphins live there too.",
+    "Scientists keep finding new species in the forest.",
+    "Conservation groups work to protect the forest.",
+    "The Amazon is often called the planet's lungs.",
 ]
 
 assert len(BASE_FACTS) == len(PARAPHRASED_FACTS) == len(DISTRACTOR_FACTS) == 20, \
