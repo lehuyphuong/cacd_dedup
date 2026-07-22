@@ -65,7 +65,12 @@ MAX_LENGTH = 512
 # so 5% steps are not available; 10% is the finest granularity that keeps
 # each sentence long enough to carry real, paraphrasable meaning while
 # keeping the whole chunk under LENGTH_GUARD (see below).
-OVERLAP_LEVELS = list(range(100, 45, -10))
+# Overlap levels to test: 100%, 90%, ..., 0% (11 levels, 10% steps).
+# Extended down to 0% (chunk_b entirely unrelated content) after the
+# 100-50% range showed prob_dup pinned at ~0.9998 throughout -- the range
+# needs to go low enough to find where, if anywhere, prob_dup actually
+# drops out of CACD's confident-duplicate zone (>= PROB_HIGH = 0.8).
+OVERLAP_LEVELS = list(range(100, -5, -10))
 
 # CACD's real length-aware guard (Section III-D / stage3_decision.py):
 # a chunk longer than this is protected from being dropped unless its NIS
