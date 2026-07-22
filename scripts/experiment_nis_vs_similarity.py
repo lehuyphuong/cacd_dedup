@@ -68,6 +68,15 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 # ── Config ────────────────────────────────────────────────────────────────────
 
 CROSS_ENCODER_MODEL = "cross-encoder/msmarco-MiniLM-L6-en-de-v1"
+
+# Second cross-encoder, trained on STS-Benchmark (continuous 0-5 similarity
+# labels) rather than MS MARCO passage-relevance ranking (mostly binary
+# relevant/not-relevant). Added to test whether the "confident, then a
+# sudden cliff" behavior seen from CACD's cross-encoder is a property of
+# cross-encoders in general, or specific to a model trained for ranking
+# rather than graded similarity.
+CROSS_ENCODER_MODEL_ALT = "cross-encoder/stsb-roberta-base"
+
 EMBED_MODEL         = "sentence-transformers/all-MiniLM-L6-v2"
 DEVICE               = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -175,14 +184,14 @@ TOPIC_PAIRS = [
         "distractor": [
             "Bee colonies house many bees.",
             "One queen lays most eggs.",
-            "Workers gather nectar and pollen.",
+            "Workers collect nectar and pollen.",
             "Bees dance to communicate.",
-            "Hives keep steady temperatures.",
+            "Hives keep steady heat.",
             "Bees make honey for energy.",
             "Colonies can last for years.",
             "Bees pollinate many crops.",
-            "Pesticides threaten bee colonies.",
-            "Beekeepers manage hives closely.",
+            "Pesticides harm bee colonies.",
+            "Beekeepers tend hives with care.",
         ],
     },
 ]
@@ -252,13 +261,20 @@ def build_pair(topic: dict, overlap_pct: int) -> tuple[str, str]:
 
 # ── Load models ──────────────────────────────────────────────────────────────
 
-print(f"Loading cross-encoder: {CROSS_ENCODER_MODEL} on {DEVICE} ...")
-tokenizer = AutoTokenizer.from_pretrained(CROSS_ENCODER_MODEL)
-cross_encoder = AutoModelForSequenceClassification.from_pretrained(
-    CROSS_ENCODER_MODEL, output_attentions=True
-)
-cross_encoder.to(DEVICE)
-cross_encoder.eval()
+def _load_cross_encoder(model_name: str):
+    """Load one cross-encoder + tokenizer pair, ready for scoring."""
+    print(f"Loading cross-encoder: {model_name} on {DEVICE} ...")
+    tok   = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name, output_attentions=True
+    )
+    model.to(DEVICE)
+    model.eval()
+    return tok, model
+
+
+tokenizer, cross_encoder = _load_cross_encoder(CROSS_ENCODER_MODEL)
+tokenizer_alt, cross_encoder_alt = _load_cross_encoder(CROSS_ENCODER_MODEL_ALT)
 
 print(f"Loading bi-encoder: {EMBED_MODEL} on {DEVICE} ...")
 bi_encoder = SentenceTransformer(EMBED_MODEL, device=DEVICE)
@@ -266,21 +282,22 @@ bi_encoder.max_seq_length = MAX_LENGTH
 print("Models loaded.\n")
 
 
-def _check_no_truncation(chunk_a: str, chunk_b: str, topic_name: str, overlap_pct: int) -> None:
+def _check_no_truncation(tok, chunk_a: str, chunk_b: str, topic_name: str, overlap_pct: int, model_label: str) -> None:
     """
-    Warn loudly if MAX_LENGTH is too small for this pair, instead of
-    letting the tokenizer silently drop the tail of chunk_b -- exactly the
-    bug that made an earlier version of this script report an identical
-    NIS and cosine_sim across most overlap levels (the differentiating
-    content near the end of chunk_b never reached the model).
+    Warn loudly if MAX_LENGTH is too small for this pair under the given
+    tokenizer, instead of letting it silently drop the tail of chunk_b --
+    exactly the bug that made an earlier version of this script report an
+    identical NIS and cosine_sim across most overlap levels (the
+    differentiating content near the end of chunk_b never reached the
+    model).
     """
-    true_len = len(tokenizer(chunk_a, chunk_b, truncation=False)["input_ids"])
+    true_len = len(tok(chunk_a, chunk_b, truncation=False)["input_ids"])
     if true_len > MAX_LENGTH:
         print(
-            f"  [WARNING] {topic_name} @ overlap={overlap_pct}%: pair is "
-            f"{true_len} tokens, exceeds MAX_LENGTH={MAX_LENGTH}. The tail "
-            f"of chunk_b will be truncated away -- this result cannot be "
-            f"trusted."
+            f"  [WARNING] [{model_label}] {topic_name} @ overlap={overlap_pct}%: "
+            f"pair is {true_len} tokens, exceeds MAX_LENGTH={MAX_LENGTH}. "
+            f"The tail of chunk_b will be truncated away -- this result "
+            f"cannot be trusted."
         )
 
 
@@ -304,23 +321,27 @@ def _check_length_guard(chunk_a: str, chunk_b: str, topic_name: str, overlap_pct
 
 # ── Scoring functions ────────────────────────────────────────────────────────
 
-@torch.no_grad()
-def compute_nis(chunk_a: str, chunk_b: str) -> dict:
+def compute_nis(tok, model, chunk_a: str, chunk_b: str) -> dict:
     """
-    Score (chunk_a, chunk_b) with the cross-encoder and compute the New
-    Information Score exactly as defined in CACD: entropy of the B=>A
+    Score (chunk_a, chunk_b) with the given cross-encoder and compute the
+    New Information Score exactly as defined in CACD: entropy of the B=>A
     attention (how much of chunk_b's tokens are explained by chunk_a),
     normalized by log|A|, averaged over the tokens of chunk_b.
+
+    Works with any BERT-family sequence-classification cross-encoder that
+    returns attentions, not just CACD_CROSS_ENCODER_MODEL -- used here to
+    compare CACD's actual cross-encoder against an STS-trained alternative.
 
     Returns dict with prob_dup (cross-encoder duplicate probability) and
     nis (New Information Score, in [0, 1]).
     """
-    inputs = tokenizer(
+    inputs = tok(
         chunk_a, chunk_b,
         return_tensors="pt", truncation=True, max_length=MAX_LENGTH, padding=True,
     ).to(DEVICE)
 
-    outputs = cross_encoder(**inputs)
+    with torch.no_grad():
+        outputs = model(**inputs)
     logits  = outputs.logits.squeeze()
     prob_dup = (
         float(torch.sigmoid(logits).item())
@@ -333,13 +354,28 @@ def compute_nis(chunk_a: str, chunk_b: str) -> dict:
 
     input_ids = inputs["input_ids"][0]
     n_tokens  = int(inputs["attention_mask"][0].sum().item())
-    sep_id    = tokenizer.sep_token_id
+    sep_id    = tok.sep_token_id
     sep_pos   = (input_ids == sep_id).nonzero(as_tuple=True)[0]
-    sep_idx   = int(sep_pos[0].item()) if len(sep_pos) > 0 else n_tokens // 2
+
+    if len(sep_pos) > 0:
+        first_sep = int(sep_pos[0].item())
+        # Some tokenizers (e.g. RoBERTa: "<s> A </s></s> B </s>") place two
+        # consecutive separator tokens between segments, not one (BERT:
+        # "[CLS] A [SEP] B [SEP]"). Skip over any run of consecutive sep
+        # tokens so b_start lands on the first real token of B in either
+        # convention, instead of silently treating a second separator as
+        # part of B.
+        b_start = first_sep + 1
+        while b_start < n_tokens and int(input_ids[b_start].item()) == sep_id:
+            b_start += 1
+        sep_idx = first_sep
+    else:
+        sep_idx = n_tokens // 2
+        b_start = sep_idx + 1
 
     len_a   = sep_idx - 1
     a_range = slice(1, sep_idx)
-    b_range = slice(sep_idx + 1, n_tokens - 1)
+    b_range = slice(b_start, n_tokens - 1)
     sub_b2a = avg_attn[b_range, a_range]       # tokens of B attending to A
 
     if sub_b2a.numel() == 0 or len_a < 2:
@@ -368,44 +404,49 @@ def compute_cosine_similarity(chunk_a: str, chunk_b: str) -> float:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run_topic_pair(topic: dict) -> list[dict]:
-    """Run the full overlap gradient for one topic pair, returning one
-    result dict per overlap level."""
+    """Run the full overlap gradient for one topic pair under both
+    cross-encoders, returning one result dict per overlap level."""
     rows = []
     for overlap_pct in OVERLAP_LEVELS:
         chunk_a, chunk_b = build_pair(topic, overlap_pct)
-        _check_no_truncation(chunk_a, chunk_b, topic["name"], overlap_pct)
+        _check_no_truncation(tokenizer, chunk_a, chunk_b, topic["name"], overlap_pct, "msmarco")
+        _check_no_truncation(tokenizer_alt, chunk_a, chunk_b, topic["name"], overlap_pct, "stsb")
         _check_length_guard(chunk_a, chunk_b, topic["name"], overlap_pct)
 
-        cos_sim = compute_cosine_similarity(chunk_a, chunk_b)
-        cacd    = compute_nis(chunk_a, chunk_b)
+        cos_sim  = compute_cosine_similarity(chunk_a, chunk_b)
+        cacd     = compute_nis(tokenizer, cross_encoder, chunk_a, chunk_b)
+        cacd_alt = compute_nis(tokenizer_alt, cross_encoder_alt, chunk_a, chunk_b)
 
         rows.append({
             "overlap_pct": overlap_pct,
             "cosine_sim":  round(cos_sim, 4),
             "nis":         cacd["nis"],
             "prob_dup":    cacd["prob_dup"],
+            "nis_alt":     cacd_alt["nis"],
+            "prob_dup_alt": cacd_alt["prob_dup"],
         })
         print(
             f"  [{overlap_pct:3d}% overlap] "
-            f"cosine_sim={cos_sim:.4f}  NIS={cacd['nis']:.4f}  "
-            f"prob_dup={cacd['prob_dup']:.4f}"
+            f"cosine_sim={cos_sim:.4f}  "
+            f"msmarco(NIS={cacd['nis']:.4f}, p_dup={cacd['prob_dup']:.4f})  "
+            f"stsb(NIS={cacd_alt['nis']:.4f}, p_dup={cacd_alt['prob_dup']:.4f})"
         )
     return rows
 
 
 def print_summary_table(rows: list[dict]) -> None:
     header = (
-        f"{'Overlap %':>10} | {'Cosine Sim':>11} | {'Sim >= 0.8?':>12} | "
-        f"{'NIS':>7} | {'1 - NIS':>8} | {'p_dup':>7}"
+        f"{'Overlap %':>10} | {'Cosine':>7} | {'Sim>=.8?':>9} | "
+        f"{'NIS(mm)':>8} | {'pdup(mm)':>9} | {'NIS(sts)':>9} | {'pdup(sts)':>10}"
     )
     print(header)
     print("-" * len(header))
     for r in rows:
         sim_flag = "DUP" if r["cosine_sim"] >= SIMILARITY_THRESHOLD else "keep"
         print(
-            f"{r['overlap_pct']:>9}% | {r['cosine_sim']:>11.4f} | "
-            f"{sim_flag:>12} | {r['nis']:>7.4f} | "
-            f"{1 - r['nis']:>8.4f} | {r['prob_dup']:>7.4f}"
+            f"{r['overlap_pct']:>9}% | {r['cosine_sim']:>7.4f} | "
+            f"{sim_flag:>9} | {r['nis']:>8.4f} | {r['prob_dup']:>9.4f} | "
+            f"{r['nis_alt']:>9.4f} | {r['prob_dup_alt']:>10.4f}"
         )
 
 
@@ -413,36 +454,54 @@ def correlations(rows: list[dict]) -> dict:
     """Pearson r (linear) and Spearman rho (monotonic rank) between each
     signal and the true overlap percentage. Reporting both matters: a
     signal can rank pairs correctly (high rho) while still being highly
-    non-linear in its raw values (lower r), or vice versa."""
-    overlaps      = np.array([r["overlap_pct"] for r in rows], dtype=float)
-    cos_vals      = np.array([r["cosine_sim"] for r in rows])
-    one_minus_nis = 1.0 - np.array([r["nis"] for r in rows])
+    non-linear in its raw values (lower r), or vice versa.
 
-    r_cos, _   = pearsonr(overlaps, cos_vals)
-    r_nis, _   = pearsonr(overlaps, one_minus_nis)
-    rho_cos, _ = spearmanr(overlaps, cos_vals)
-    rho_nis, _ = spearmanr(overlaps, one_minus_nis)
+    Includes prob_dup for both cross-encoders (not just NIS), since the
+    central question at this point is whether prob_dup's "confident, then
+    a sudden cliff" behavior is specific to CACD's MS MARCO-trained
+    cross-encoder or general to cross-encoders repurposed this way."""
+    overlaps          = np.array([r["overlap_pct"] for r in rows], dtype=float)
+    cos_vals          = np.array([r["cosine_sim"] for r in rows])
+    one_minus_nis     = 1.0 - np.array([r["nis"] for r in rows])
+    one_minus_nis_alt = 1.0 - np.array([r["nis_alt"] for r in rows])
+    prob_dup          = np.array([r["prob_dup"] for r in rows])
+    prob_dup_alt      = np.array([r["prob_dup_alt"] for r in rows])
+
+    def _both(vals):
+        r_, _   = pearsonr(overlaps, vals)
+        rho_, _ = spearmanr(overlaps, vals)
+        return r_, rho_
+
+    r_cos, rho_cos     = _both(cos_vals)
+    r_nis, rho_nis     = _both(one_minus_nis)
+    r_nis_a, rho_nis_a = _both(one_minus_nis_alt)
+    r_pd, rho_pd       = _both(prob_dup)
+    r_pd_a, rho_pd_a   = _both(prob_dup_alt)
 
     return {
-        "pearson_cosine": r_cos, "pearson_nis": r_nis,
-        "spearman_cosine": rho_cos, "spearman_nis": rho_nis,
+        "pearson_cosine": r_cos, "spearman_cosine": rho_cos,
+        "pearson_nis": r_nis, "spearman_nis": rho_nis,
+        "pearson_nis_alt": r_nis_a, "spearman_nis_alt": rho_nis_a,
+        "pearson_probdup": r_pd, "spearman_probdup": rho_pd,
+        "pearson_probdup_alt": r_pd_a, "spearman_probdup_alt": rho_pd_a,
     }
 
 
 def main():
-    print("=" * 84)
+    print("=" * 92)
     print("NIS vs. Cosine Similarity across a controlled semantic-overlap gradient")
-    print(f"Cross-encoder: {CROSS_ENCODER_MODEL}")
-    print(f"Bi-encoder:    {EMBED_MODEL}")
-    print(f"Topic pairs:   {len(TOPIC_PAIRS)}")
-    print("=" * 84)
+    print(f"Cross-encoder (CACD):     {CROSS_ENCODER_MODEL}")
+    print(f"Cross-encoder (STS, alt): {CROSS_ENCODER_MODEL_ALT}")
+    print(f"Bi-encoder:               {EMBED_MODEL}")
+    print(f"Topic pairs:              {len(TOPIC_PAIRS)}")
+    print("=" * 92)
 
     all_corrs = []
     for topic in TOPIC_PAIRS:
         print()
-        print("-" * 84)
+        print("-" * 92)
         print(f"Topic pair: {topic['name']}")
-        print("-" * 84)
+        print("-" * 92)
         rows = run_topic_pair(topic)
 
         print()
@@ -451,43 +510,47 @@ def main():
         corr = correlations(rows)
         all_corrs.append(corr)
         print()
-        print(f"  Pearson r   -- cosine_sim: {corr['pearson_cosine']:.4f}  "
-              f"| (1-NIS): {corr['pearson_nis']:.4f}")
-        print(f"  Spearman rho-- cosine_sim: {corr['spearman_cosine']:.4f}  "
-              f"| (1-NIS): {corr['spearman_nis']:.4f}")
+        print(f"  Pearson r    -- cosine: {corr['pearson_cosine']:.4f} | "
+              f"(1-NIS) mm: {corr['pearson_nis']:.4f} | (1-NIS) sts: {corr['pearson_nis_alt']:.4f} | "
+              f"p_dup mm: {corr['pearson_probdup']:.4f} | p_dup sts: {corr['pearson_probdup_alt']:.4f}")
+        print(f"  Spearman rho -- cosine: {corr['spearman_cosine']:.4f} | "
+              f"(1-NIS) mm: {corr['spearman_nis']:.4f} | (1-NIS) sts: {corr['spearman_nis_alt']:.4f} | "
+              f"p_dup mm: {corr['spearman_probdup']:.4f} | p_dup sts: {corr['spearman_probdup_alt']:.4f}")
 
     # ── Averaged across all topic pairs ─────────────────────────────────────
     print()
-    print("=" * 84)
+    print("=" * 92)
     print(f"AVERAGED ACROSS {len(TOPIC_PAIRS)} TOPIC PAIRS")
-    print("=" * 84)
-    for key in ["pearson_cosine", "pearson_nis", "spearman_cosine", "spearman_nis"]:
+    print("=" * 92)
+    keys = [
+        "pearson_cosine", "pearson_nis", "pearson_nis_alt", "pearson_probdup", "pearson_probdup_alt",
+        "spearman_cosine", "spearman_nis", "spearman_nis_alt", "spearman_probdup", "spearman_probdup_alt",
+    ]
+    for key in keys:
         vals = [c[key] for c in all_corrs]
         mean = np.mean(vals)
         spread = f"(individual: {', '.join(f'{v:.4f}' for v in vals)})"
-        print(f"  {key:<16}: mean = {mean:.4f}  {spread}")
+        print(f"  {key:<22}: mean = {mean:.4f}  {spread}")
 
     print()
     print("Interpretation:")
-    print("  chunk_b is built from paraphrases at every overlap level, never")
-    print("  literal copies, so any lexical overlap between chunk_a and")
-    print("  chunk_b is incidental, not by design. This is the case a pooled")
-    print("  bi-encoder vector is most at risk of misjudging: two chunks can")
-    print("  share little surface wording while still meaning the same thing.")
-    print("  Pearson r measures whether a signal's raw values scale linearly")
-    print("  with true overlap; Spearman rho measures whether a signal ranks")
-    print("  pairs in the correct order, regardless of whether that")
-    print("  relationship is linear. A signal can be perfectly ranked (rho =")
-    print("  1) while still being highly compressed or non-linear in its raw")
-    print("  values (lower r) -- check both before concluding either signal")
-    print("  is 'better' from a single number. With only two topic pairs")
-    print("  here, treat the averaged numbers as a first look, not a settled")
-    print("  result; more topic pairs would make this more conclusive.")
+    print("  'mm' = CACD's actual cross-encoder (trained on MS MARCO passage")
+    print("  ranking, mostly binary relevant/not-relevant); 'sts' = an")
+    print("  alternative cross-encoder trained on STS-Benchmark (continuous")
+    print("  0-5 similarity labels). If p_dup(sts) correlates with true")
+    print("  overlap noticeably better than p_dup(mm), that points to the")
+    print("  training objective, not the cross-encoder architecture or CACD's")
+    print("  design, as the source of the earlier flat-then-cliff behavior --")
+    print("  a model trained for graded similarity should be better")
+    print("  calibrated across partial overlap than one trained mostly for")
+    print("  binary relevance ranking. If both still show the same cliff")
+    print("  pattern, that points more toward the paraphrase/distractor")
+    print("  sentence style itself, or the fact-list construction, rather")
+    print("  than the specific cross-encoder used.")
+    print("  With only two topic pairs, treat all averaged numbers as a")
+    print("  first look, not a settled result.")
     print("  'Sim >= 0.8?' marks where the Similarity baseline's fixed")
-    print("  threshold would call the pair a duplicate at each overlap")
-    print("  level; a threshold that stays DUP across most of the 50-100%")
-    print("  range would fail to separate near-duplicate chunks from only")
-    print("  loosely related ones.")
+    print("  threshold would call the pair a duplicate at each overlap level.")
 
 
 if __name__ == "__main__":
