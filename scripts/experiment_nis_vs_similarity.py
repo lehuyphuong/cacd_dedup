@@ -1,0 +1,281 @@
+"""
+scripts/experiment_nis_vs_similarity.py
+
+Standalone experiment: compares CACD's New Information Score (NIS) against
+plain cosine similarity (the Similarity baseline's signal) across a
+controlled gradient of shared content, from 100% down to 50% overlap in
+5% steps.
+
+Why this experiment exists: a good redundancy signal should track the
+true amount of shared content smoothly and predictably as two chunks
+drift apart, rather than saturating near a constant value or dropping
+too sharply. This script builds chunk pairs with an exact, known overlap
+percentage and reports both signals side by side, so the two can be
+compared directly against the same ground truth.
+
+How overlap is controlled: chunk A is always the same 20-sentence
+passage. Chunk B keeps the first N sentences of chunk A verbatim and
+replaces the remaining (20 - N) sentences with sentences from an
+unrelated passage, so chunk A and chunk B share exactly N/20 = the
+target overlap percentage of their content by construction, not by
+estimation.
+
+No dependency on the benchmark pipeline -- only requires:
+  pip install transformers sentence-transformers torch numpy
+
+Run from the project root:
+  python scripts/experiment_nis_vs_similarity.py
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import torch
+from sentence_transformers import SentenceTransformer
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+CROSS_ENCODER_MODEL = "cross-encoder/msmarco-MiniLM-L6-en-de-v1"
+EMBED_MODEL         = "sentence-transformers/all-MiniLM-L6-v2"
+DEVICE               = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Overlap levels to test: 100%, 95%, 90%, ..., 50% (11 levels)
+OVERLAP_LEVELS = list(range(100, 45, -5))
+
+# Similarity baseline threshold used elsewhere in this paper's experiments,
+# shown here only to mark where cosine similarity would call two chunks
+# duplicates at each overlap level.
+SIMILARITY_THRESHOLD = 0.8
+
+# ── Controlled-overlap chunk pairs ──────────────────────────────────────────
+
+# Chunk A is always the concatenation of all 20 sentences below.
+BASE_FACTS = [
+    "The Eiffel Tower is located in Paris, France.",
+    "It was designed by the engineer Gustave Eiffel.",
+    "Construction began in January 1887.",
+    "The tower was completed in March 1889.",
+    "It was built for the 1889 World's Fair.",
+    "The tower stands 330 meters tall.",
+    "It was the tallest man-made structure until 1930.",
+    "The structure is made of wrought iron.",
+    "It weighs approximately 10,100 tons.",
+    "The tower has three visitor levels.",
+    "Around seven million people visit it each year.",
+    "It is one of the most recognizable landmarks in the world.",
+    "The tower is repainted every seven years.",
+    "It uses about 60 tons of paint per repainting.",
+    "The tower sways slightly in strong wind.",
+    "It was originally intended as a temporary structure.",
+    "The tower has 108 stories.",
+    "Its base is a square measuring 125 meters per side.",
+    "The tower is illuminated by 20,000 light bulbs at night.",
+    "It remains a global symbol of France.",
+]
+
+# Unrelated sentences used to replace BASE_FACTS sentences in chunk B as
+# the target overlap decreases, keeping chunk length roughly constant so
+# overlap percentage is not confounded with chunk length.
+DISTRACTOR_FACTS = [
+    "The Amazon rainforest covers much of northwestern Brazil.",
+    "It extends into Peru, Colombia, and other South American countries.",
+    "The forest spans roughly 5.5 million square kilometers.",
+    "It is the largest tropical rainforest on Earth.",
+    "The Amazon River flows through the forest.",
+    "The river discharges more water than any other river.",
+    "The rainforest is home to millions of species.",
+    "It contains about 10 percent of the world's known species.",
+    "Many indigenous communities live within the forest.",
+    "The forest plays a major role in regulating global climate.",
+    "It produces roughly 20 percent of the world's oxygen.",
+    "Deforestation threatens large areas of the rainforest each year.",
+    "Logging and agriculture are major causes of forest loss.",
+    "The canopy can reach heights of over 40 meters.",
+    "Rainfall in the region can exceed 2,000 millimeters annually.",
+    "The forest supports thousands of bird species.",
+    "It is also home to jaguars, sloths, and river dolphins.",
+    "Scientists continue to discover new species there.",
+    "Conservation efforts aim to protect remaining forest areas.",
+    "The Amazon is often called the lungs of the planet.",
+]
+
+assert len(BASE_FACTS) == len(DISTRACTOR_FACTS) == 20, \
+    "Both fact lists must have exactly 20 sentences for clean 5% steps."
+
+
+def build_pair(overlap_pct: int) -> tuple[str, str]:
+    """
+    Build one (chunk_a, chunk_b) pair at a target overlap level.
+
+    chunk_a is always the full 20-sentence base passage. chunk_b keeps
+    the first n_keep sentences of chunk_a verbatim and replaces the rest
+    with sentences from an unrelated passage, so the two chunks share
+    exactly overlap_pct percent of their content by construction.
+    """
+    n_total = len(BASE_FACTS)
+    n_keep  = round(n_total * overlap_pct / 100)
+    chunk_a = " ".join(BASE_FACTS)
+    chunk_b = " ".join(BASE_FACTS[:n_keep] + DISTRACTOR_FACTS[n_keep:])
+    return chunk_a, chunk_b
+
+
+# ── Load models ──────────────────────────────────────────────────────────────
+
+print(f"Loading cross-encoder: {CROSS_ENCODER_MODEL} on {DEVICE} ...")
+tokenizer = AutoTokenizer.from_pretrained(CROSS_ENCODER_MODEL)
+cross_encoder = AutoModelForSequenceClassification.from_pretrained(
+    CROSS_ENCODER_MODEL, output_attentions=True
+)
+cross_encoder.to(DEVICE)
+cross_encoder.eval()
+
+print(f"Loading bi-encoder: {EMBED_MODEL} on {DEVICE} ...")
+bi_encoder = SentenceTransformer(EMBED_MODEL, device=DEVICE)
+print("Models loaded.\n")
+
+
+# ── Scoring functions ────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def compute_nis(chunk_a: str, chunk_b: str) -> dict:
+    """
+    Score (chunk_a, chunk_b) with the cross-encoder and compute the New
+    Information Score exactly as defined in CACD: entropy of the B=>A
+    attention (how much of chunk_b's tokens are explained by chunk_a),
+    normalized by log|A|, averaged over the tokens of chunk_b.
+
+    Returns dict with prob_dup (cross-encoder duplicate probability) and
+    nis (New Information Score, in [0, 1]).
+    """
+    inputs = tokenizer(
+        chunk_a, chunk_b,
+        return_tensors="pt", truncation=True, max_length=256, padding=True,
+    ).to(DEVICE)
+
+    outputs = cross_encoder(**inputs)
+    logits  = outputs.logits.squeeze()
+    prob_dup = (
+        float(torch.sigmoid(logits).item())
+        if logits.dim() == 0
+        else float(torch.softmax(logits, dim=-1)[-1].item())
+    )
+
+    last_attn = outputs.attentions[-1][0]      # (num_heads, seq, seq)
+    avg_attn  = last_attn.mean(dim=0)          # (seq, seq)
+
+    input_ids = inputs["input_ids"][0]
+    n_tokens  = int(inputs["attention_mask"][0].sum().item())
+    sep_id    = tokenizer.sep_token_id
+    sep_pos   = (input_ids == sep_id).nonzero(as_tuple=True)[0]
+    sep_idx   = int(sep_pos[0].item()) if len(sep_pos) > 0 else n_tokens // 2
+
+    len_a   = sep_idx - 1
+    a_range = slice(1, sep_idx)
+    b_range = slice(sep_idx + 1, n_tokens - 1)
+    sub_b2a = avg_attn[b_range, a_range]       # tokens of B attending to A
+
+    if sub_b2a.numel() == 0 or len_a < 2:
+        nis = 1.0
+    else:
+        row_sums = sub_b2a.sum(dim=1, keepdim=True).clamp(min=1e-9)
+        p_b2a    = sub_b2a / row_sums
+        ent      = -(p_b2a * torch.log(p_b2a + 1e-9)).sum(dim=1)
+        max_ent  = float(np.log(len_a))
+        nis = (
+            float((ent / max_ent).mean().clamp(0.0, 1.0).item())
+            if max_ent > 1e-9 else 1.0
+        )
+
+    return {"prob_dup": round(prob_dup, 4), "nis": round(nis, 4)}
+
+
+def compute_cosine_similarity(chunk_a: str, chunk_b: str) -> float:
+    """Cosine similarity between chunk_a and chunk_b under the same
+    bi-encoder used by the Similarity baseline (L2-normalized dense
+    embeddings, dot product = cosine similarity)."""
+    vecs = bi_encoder.encode([chunk_a, chunk_b], normalize_embeddings=True)
+    return float(np.dot(vecs[0], vecs[1]))
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    print("=" * 84)
+    print("NIS vs. Cosine Similarity across a controlled content-overlap gradient")
+    print(f"Cross-encoder: {CROSS_ENCODER_MODEL}")
+    print(f"Bi-encoder:    {EMBED_MODEL}")
+    print("=" * 84)
+    print()
+
+    rows = []
+    for overlap_pct in OVERLAP_LEVELS:
+        chunk_a, chunk_b = build_pair(overlap_pct)
+        cos_sim = compute_cosine_similarity(chunk_a, chunk_b)
+        cacd    = compute_nis(chunk_a, chunk_b)
+
+        rows.append({
+            "overlap_pct": overlap_pct,
+            "cosine_sim":  round(cos_sim, 4),
+            "nis":         cacd["nis"],
+            "prob_dup":    cacd["prob_dup"],
+        })
+
+        print(
+            f"[{overlap_pct:3d}% overlap] "
+            f"cosine_sim={cos_sim:.4f}  NIS={cacd['nis']:.4f}  "
+            f"prob_dup={cacd['prob_dup']:.4f}"
+        )
+
+    # ── Summary table ────────────────────────────────────────────────────────
+    print()
+    print("=" * 84)
+    print("SUMMARY TABLE")
+    print("=" * 84)
+    header = (
+        f"{'Overlap %':>10} | {'Cosine Sim':>11} | {'Sim >= 0.8?':>12} | "
+        f"{'NIS':>7} | {'1 - NIS':>8} | {'p_dup':>7}"
+    )
+    print(header)
+    print("-" * len(header))
+    for r in rows:
+        sim_flag = "DUP" if r["cosine_sim"] >= SIMILARITY_THRESHOLD else "keep"
+        print(
+            f"{r['overlap_pct']:>9}% | {r['cosine_sim']:>11.4f} | "
+            f"{sim_flag:>12} | {r['nis']:>7.4f} | "
+            f"{1 - r['nis']:>8.4f} | {r['prob_dup']:>7.4f}"
+        )
+
+    # ── Correlation with ground-truth overlap ──────────────────────────────
+    overlaps      = np.array([r["overlap_pct"] for r in rows], dtype=float)
+    cos_vals      = np.array([r["cosine_sim"] for r in rows])
+    one_minus_nis = 1.0 - np.array([r["nis"] for r in rows])
+
+    r_cos = np.corrcoef(overlaps, cos_vals)[0, 1]
+    r_nis = np.corrcoef(overlaps, one_minus_nis)[0, 1]
+
+    print()
+    print("=" * 84)
+    print("Correlation with the true overlap percentage (Pearson r; higher is better)")
+    print("=" * 84)
+    print(f"  cosine_sim  vs. overlap_pct : r = {r_cos:.4f}")
+    print(f"  (1 - NIS)   vs. overlap_pct : r = {r_nis:.4f}")
+    print()
+    print("Interpretation:")
+    print("  Both cosine_sim and (1 - NIS) are read here as redundancy")
+    print("  signals on a comparable [0, 1] scale: higher means the two")
+    print("  chunks are judged more alike. Since overlap_pct is the exact,")
+    print("  known ground truth by construction, the signal whose values")
+    print("  track overlap_pct more closely (larger Pearson r, and a wider")
+    print("  spread of scores across the 50-100% range instead of staying")
+    print("  near a constant value) is the more informative redundancy")
+    print("  signal on this gradient.")
+    print("  'Sim >= 0.8?' marks where the Similarity baseline's fixed")
+    print("  threshold would call the pair a duplicate at each overlap")
+    print("  level; a threshold that stays DUP across most of the 50-100%")
+    print("  range would fail to separate near-duplicate chunks from only")
+    print("  loosely related ones.")
+
+
+if __name__ == "__main__":
+    main()
