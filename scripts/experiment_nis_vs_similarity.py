@@ -22,10 +22,18 @@ holds several independent (base, paraphrase, distractor) triples; results
 are reported per pair and averaged across pairs.
 
 How overlap is controlled: chunk A is always the same base passage for a
-given topic pair. Chunk B keeps a paraphrase (never a copy) of the first
-N sentences of chunk A and replaces the remaining sentences with sentences
-from an unrelated passage, so chunk A and chunk B share exactly the target
-overlap percentage of their meaning by construction, not by estimation.
+given topic pair. Chunk B keeps a paraphrase (never a copy) of overlap_pct
+percent of chunk A's sentences and replaces the rest with sentences from
+an unrelated passage. WHICH sentences are replaced follows a fixed,
+reproducible scatter order rather than always cutting off the tail, so
+the replaced sentences are spread throughout chunk B instead of
+concentrated in one contiguous block -- this was changed after an earlier
+block-concatenation design showed prob_dup staying flat across most of
+the gradient and then dropping abruptly near 0% overlap, rather than
+declining gradually; scattering removes the single sharp "topic breaks
+here" point a block design creates, so it isolates whether that
+abruptness came from the block structure or is a property of the
+classifier itself. See _removal_order and build_pair for details.
 
 Sentence and chunk length: kept short (~7-8 words per sentence, whole
 chunk under ~300 characters) for two independent reasons found while
@@ -184,21 +192,61 @@ for _tp in TOPIC_PAIRS:
         f"Topic pair '{_tp['name']}': base/paraphrase/distractor must be the same length."
 
 
+def _removal_order(n_total: int, seed: int = 42) -> list[int]:
+    """
+    A fixed, reproducible random permutation of sentence positions, used to
+    decide WHICH positions get replaced by distractor content first as
+    overlap decreases. Using a shuffled order instead of always removing
+    from the end scatters the distractor sentences throughout chunk_b
+    rather than concentrating them in one block at the tail.
+
+    This directly tests a specific hypothesis: the earlier block-concatenation
+    design (keep sentences 0..n_keep-1, replace n_keep..end) put every
+    replaced sentence in one contiguous run at the end of chunk_b, creating
+    a single sharp "topic breaks here" point partway through the passage.
+    A cross-encoder attending over the whole sequence may respond to that
+    structural discontinuity itself, not just to the true overlap
+    percentage, which could explain why prob_dup stayed flat and then
+    dropped abruptly rather than declining gradually. Scattering the
+    replacements removes that single breakpoint; if prob_dup still jumps
+    abruptly with scattering, the flat-then-cliff behavior is more likely
+    an inherent property of this classifier head, not an artifact of
+    block placement.
+    """
+    import random
+    order = list(range(n_total))
+    random.Random(seed).shuffle(order)
+    return order
+
+
 def build_pair(topic: dict, overlap_pct: int) -> tuple[str, str]:
     """
     Build one (chunk_a, chunk_b) pair at a target semantic-overlap level
     for the given topic dict (one entry of TOPIC_PAIRS).
 
     chunk_a is always the full base passage. chunk_b keeps a paraphrase
-    (never a copy) of the first n_keep sentences of chunk_a and replaces
-    the rest with sentences from an unrelated passage, so the two chunks
-    share exactly overlap_pct percent of their meaning by construction,
-    with no guaranteed literal wording in common anywhere.
+    (never a copy) of overlap_pct percent of chunk_a's sentences and
+    replaces the rest with sentences from an unrelated passage, so the two
+    chunks share exactly that percentage of their meaning by construction,
+    with no guaranteed literal wording in common anywhere. WHICH sentences
+    are replaced is decided by a fixed scatter order (_removal_order), not
+    by always cutting off the tail, so the replaced sentences are spread
+    throughout chunk_b rather than concentrated in one contiguous block.
+    Higher overlap levels are a strict superset of lower ones: the
+    sentence removed going from 100% to 90% stays removed at every lower
+    level too, so the gradient decays monotonically.
     """
-    n_total = len(topic["base"])
-    n_keep  = round(n_total * overlap_pct / 100)
+    n_total  = len(topic["base"])
+    n_keep   = round(n_total * overlap_pct / 100)
+    n_remove = n_total - n_keep
+    removed_positions = set(_removal_order(n_total)[:n_remove])
+
     chunk_a = " ".join(topic["base"])
-    chunk_b = " ".join(topic["paraphrase"][:n_keep] + topic["distractor"][n_keep:])
+    chunk_b_sentences = [
+        topic["distractor"][i] if i in removed_positions else topic["paraphrase"][i]
+        for i in range(n_total)
+    ]
+    chunk_b = " ".join(chunk_b_sentences)
     return chunk_a, chunk_b
 
 
