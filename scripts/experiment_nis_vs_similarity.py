@@ -13,7 +13,7 @@ B here is built from genuine paraphrases of chunk A's content, not copies
 of it, so at 100% "overlap" the two chunks share no guaranteed literal
 wording at all, only meaning.
 
-How overlap is controlled: chunk A is always the same 20-sentence passage.
+How overlap is controlled: chunk A is always the same 10-sentence passage.
 Chunk B keeps a paraphrased version of the first N sentences of chunk A
 (same meaning, different wording and sentence structure) and replaces the
 remaining (20 - N) sentences with sentences from an unrelated passage, so
@@ -60,8 +60,22 @@ DEVICE               = "cuda" if torch.cuda.is_available() else "cpu"
 # fix for exceeding it is to shorten the input text, not raise this value.
 MAX_LENGTH = 512
 
-# Overlap levels to test: 100%, 95%, 90%, ..., 50% (11 levels)
-OVERLAP_LEVELS = list(range(100, 45, -5))
+# Overlap levels to test: 100%, 90%, 80%, ..., 50% (6 levels, 10% steps).
+# Only 10 sentence units are used in this version (see BASE_FACTS below),
+# so 5% steps are not available; 10% is the finest granularity that keeps
+# each sentence long enough to carry real, paraphrasable meaning while
+# keeping the whole chunk under LENGTH_GUARD (see below).
+OVERLAP_LEVELS = list(range(100, 45, -10))
+
+# CACD's real length-aware guard (Section III-D / stage3_decision.py):
+# a chunk longer than this is protected from being dropped unless its NIS
+# falls below NIS_FLOOR. The chunks in the earlier version of this script
+# (~800-950 characters) were always longer than this, so CACD's real
+# decision logic would have kept every pair regardless of overlap level --
+# the guard, not NIS or cosine_sim, was deciding the outcome. Chunks here
+# are deliberately built to stay under this threshold so that comparison
+# no longer applies.
+LENGTH_GUARD = 300
 
 # Similarity baseline threshold used elsewhere in this paper's experiments,
 # shown here only to mark where cosine similarity would call two chunks
@@ -71,90 +85,62 @@ SIMILARITY_THRESHOLD = 0.8
 # ── Controlled-overlap chunk pairs (semantic, not verbatim) ────────────────
 
 # Chunk A is always the concatenation of all 20 sentences below.
+# Chunk A is always the concatenation of all 10 sentences below. Kept short
+# (~230 characters total) so the whole chunk stays under LENGTH_GUARD; see
+# _check_length_guard below, which verifies this at runtime for every pair.
 BASE_FACTS = [
-    "The Eiffel Tower stands in Paris, France.",
-    "Gustave Eiffel designed and built the tower.",
-    "Construction began in January 1887.",
-    "The tower opened to the public in 1889.",
-    "It was built for the 1889 World's Fair.",
-    "The tower stands about 330 meters tall.",
-    "It was the tallest structure until 1930.",
-    "The tower is made of wrought iron.",
-    "It weighs about ten thousand tons.",
-    "The tower has three public levels.",
-    "Seven million people visit it yearly.",
-    "It is one of the world's most recognizable landmarks.",
-    "The tower is repainted every seven years.",
-    "Repainting uses about sixty tons of paint.",
-    "Strong winds make the tower sway slightly.",
-    "It was originally meant to be temporary.",
-    "The tower has 108 stories architecturally.",
-    "Its base forms a square 125 meters wide.",
-    "Twenty thousand bulbs light it at night.",
-    "It remains a lasting symbol of France.",
+    "The tower is in Paris.",
+    "It was built by Eiffel.",
+    "Work began in 1887.",
+    "It opened in 1889.",
+    "It stands 330 meters tall.",
+    "It was tallest until 1930.",
+    "It is made of iron.",
+    "It weighs 10,000 tons.",
+    "Millions visit each year.",
+    "It symbolizes France.",
 ]
 
 # Genuine paraphrases of BASE_FACTS, same order, same meaning, deliberately
-# different wording and sentence structure -- this is the "semantic overlap"
-# content used to build chunk B, never a copy of BASE_FACTS.
+# different wording -- this is the "semantic overlap" content used to
+# build chunk B, never a copy of BASE_FACTS.
 PARAPHRASED_FACTS = [
-    "The famous tower is located in Paris.",
-    "The landmark was designed by Gustave Eiffel.",
-    "Building work started at the beginning of 1887.",
-    "The tower welcomed visitors starting in 1889.",
-    "It served as the gateway for the 1889 World's Fair.",
-    "The structure reaches roughly 330 meters high.",
-    "For decades, it was the tallest man-made structure.",
-    "Wrought iron makes up the tower's frame.",
-    "The completed tower weighs around 10,100 tons.",
-    "Visitors can access three separate levels.",
-    "About seven million tourists visit each year.",
-    "Few landmarks are as widely recognized as this one.",
-    "The tower gets repainted roughly every seven years.",
-    "Each repainting takes close to sixty tons of paint.",
-    "The upper tower sways a bit in high wind.",
-    "Engineers originally planned it as a temporary structure.",
-    "The frame is often described as 108 stories.",
-    "The base is shaped like a square, 125 meters wide.",
-    "About twenty thousand bulbs illuminate it nightly.",
-    "It still stands today as a symbol of France.",
+    "The tower sits in Paris.",
+    "Eiffel built the tower.",
+    "Building started in 1887.",
+    "It welcomed guests in 1889.",
+    "It rises about 330 meters.",
+    "It led in height until 1930.",
+    "Iron makes up its frame.",
+    "Its weight is near 10,000 tons.",
+    "Many tourists come yearly.",
+    "It stands for France.",
 ]
 
 # Unrelated sentences used to replace PARAPHRASED_FACTS sentences in chunk B
-# as the target overlap decreases, keeping chunk length roughly constant so
-# overlap percentage is not confounded with chunk length.
+# as the target overlap decreases.
 DISTRACTOR_FACTS = [
-    "The Amazon rainforest covers much of Brazil.",
-    "It also extends into Peru and Colombia.",
-    "The forest spans about 5.5 million square kilometers.",
-    "It is the largest tropical rainforest on Earth.",
-    "The Amazon River flows through the forest.",
-    "It carries more water than any other river.",
-    "Millions of species live within the forest.",
-    "It holds roughly ten percent of known species.",
-    "Indigenous communities have lived there for generations.",
-    "The forest helps regulate the global climate.",
-    "It produces about twenty percent of the world's oxygen.",
-    "Large areas are lost to deforestation yearly.",
-    "Logging and farming drive most forest loss.",
-    "In places, the canopy exceeds forty meters.",
-    "Some regions get over two thousand millimeters of rain.",
-    "The forest hosts thousands of bird species.",
-    "Jaguars, sloths, and river dolphins live there too.",
-    "Scientists keep finding new species in the forest.",
-    "Conservation groups work to protect the forest.",
-    "The Amazon is often called the planet's lungs.",
+    "The Amazon is in Brazil.",
+    "It reaches into Peru too.",
+    "It covers millions of km2.",
+    "It's the largest rainforest.",
+    "The Amazon River flows there.",
+    "It holds many species.",
+    "Communities live within it.",
+    "It affects global climate.",
+    "Deforestation harms the forest.",
+    "It's called Earth's lungs.",
 ]
 
-assert len(BASE_FACTS) == len(PARAPHRASED_FACTS) == len(DISTRACTOR_FACTS) == 20, \
-    "All three fact lists must have exactly 20 sentences for clean 5% steps."
+assert len(BASE_FACTS) == len(PARAPHRASED_FACTS) == len(DISTRACTOR_FACTS) == 10, \
+    "All three fact lists must have exactly 10 sentences for clean 10% steps."
 
 
 def build_pair(overlap_pct: int) -> tuple[str, str]:
     """
     Build one (chunk_a, chunk_b) pair at a target semantic-overlap level.
 
-    chunk_a is always the full 20-sentence base passage. chunk_b keeps a
+    chunk_a is always the full 10-sentence base passage. chunk_b keeps a
     paraphrase (never a copy) of the first n_keep sentences of chunk_a and
     replaces the rest with sentences from an unrelated passage, so the two
     chunks share exactly overlap_pct percent of their meaning by
@@ -199,6 +185,26 @@ def _check_no_truncation(chunk_a: str, chunk_b: str, overlap_pct: int) -> None:
             f"truncated away -- results at this overlap level cannot be "
             f"trusted. Shorten the fact sentences or raise MAX_LENGTH."
         )
+
+
+def _check_length_guard(chunk_a: str, chunk_b: str, overlap_pct: int) -> None:
+    """
+    Warn if either chunk exceeds CACD's real LENGTH_GUARD. A chunk longer
+    than LENGTH_GUARD is protected from being dropped in the real pipeline
+    unless its NIS falls below NIS_FLOOR (0.3); if that never happens on
+    this gradient, the length guard -- not NIS or cosine_sim -- would be
+    the thing actually deciding CACD's outcome for every pair, making the
+    NIS-vs-cosine_sim comparison here moot for the real decision rule.
+    """
+    for name, chunk in [("chunk_a", chunk_a), ("chunk_b", chunk_b)]:
+        if len(chunk) > LENGTH_GUARD:
+            print(
+                f"  [WARNING] overlap={overlap_pct}%: {name} is {len(chunk)} "
+                f"characters, exceeds LENGTH_GUARD={LENGTH_GUARD}. In the "
+                f"real CACD pipeline this pair would be protected from "
+                f"being dropped whenever NIS > NIS_FLOOR (0.3), regardless "
+                f"of what cosine_sim or NIS actually says."
+            )
 
 
 # ── Scoring functions ────────────────────────────────────────────────────────
@@ -278,6 +284,7 @@ def main():
     for overlap_pct in OVERLAP_LEVELS:
         chunk_a, chunk_b = build_pair(overlap_pct)
         _check_no_truncation(chunk_a, chunk_b, overlap_pct)
+        _check_length_guard(chunk_a, chunk_b, overlap_pct)
         cos_sim = compute_cosine_similarity(chunk_a, chunk_b)
         cacd    = compute_nis(chunk_a, chunk_b)
 
