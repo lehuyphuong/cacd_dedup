@@ -20,6 +20,16 @@ remaining (20 - N) sentences with sentences from an unrelated passage, so
 chunk A and chunk B share exactly N/20 = the target overlap percentage of
 their content by construction, not by estimation.
 
+Sentence length is deliberately kept to roughly 10 words per sentence
+(20 sentences per chunk, ~200 words / ~260 tokens total). An earlier
+version of this script used much longer sentences (~2200 characters,
+~440 tokens per chunk), which silently exceeded the tokenizer's
+max_length and got truncated -- the model never saw the differentiating
+content near the end of chunk_b for most overlap levels, which made NIS
+and cosine_sim come out identical across most of the gradient. This
+script also asserts at runtime that no truncation occurs (see
+_check_no_truncation), so that failure mode cannot silently recur.
+
 No dependency on the benchmark pipeline -- only requires:
   pip install transformers sentence-transformers torch numpy
 
@@ -40,6 +50,13 @@ CROSS_ENCODER_MODEL = "cross-encoder/msmarco-MiniLM-L6-en-de-v1"
 EMBED_MODEL         = "sentence-transformers/all-MiniLM-L6-v2"
 DEVICE               = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Max sequence length for both the cross-encoder pair and the bi-encoder.
+# 512 is the standard BERT-family limit; both models used here are built
+# on that architecture. Kept as a named constant (not a magic number)
+# because _check_no_truncation below needs the same value used at
+# tokenization time.
+MAX_LENGTH = 512
+
 # Overlap levels to test: 100%, 95%, 90%, ..., 50% (11 levels)
 OVERLAP_LEVELS = list(range(100, 45, -5))
 
@@ -52,78 +69,78 @@ SIMILARITY_THRESHOLD = 0.8
 
 # Chunk A is always the concatenation of all 20 sentences below.
 BASE_FACTS = [
-    "The Eiffel Tower, an iconic iron lattice structure, stands prominently on the Champ de Mars in central Paris, France.",
-    "French engineer Gustave Eiffel and his company were responsible for designing and constructing this famous landmark.",
-    "Work on the tower's foundations and ironwork officially commenced in January of 1887, following years of planning.",
-    "After more than two years of construction, the tower was finally completed and opened in March 1889.",
-    "The structure was originally built to serve as the entrance arch for the 1889 World's Fair, held in Paris.",
-    "Rising to a height of approximately 330 meters, the tower was an extraordinary engineering achievement for its era.",
-    "For over four decades, until 1930, it held the record as the tallest man-made structure anywhere in the world.",
-    "The entire framework of the tower is constructed from puddled wrought iron, chosen for its strength and relative lightness.",
-    "In total, the finished structure weighs approximately ten thousand one hundred metric tons, excluding non-structural elements.",
-    "Visitors can access the tower via three distinct public levels, each offering different views of the surrounding city.",
-    "Each year, the tower draws roughly seven million visitors from around the world, making it a major tourist destination.",
-    "It is widely regarded as one of the most instantly recognizable landmarks anywhere on the planet.",
-    "To protect it from corrosion, the tower undergoes a fresh coat of paint approximately once every seven years.",
-    "A single repainting effort requires roughly sixty tons of specially formulated paint applied by hand.",
-    "During periods of strong wind, the upper sections of the tower can sway slightly from side to side.",
-    "Interestingly, the structure was originally intended to be a temporary installation, dismantled after twenty years.",
-    "The tower's iron framework comprises what is often described as 108 stories when counted architecturally.",
-    "At its base, the structure forms a square measuring approximately 125 meters along each side.",
-    "After dark, the tower is illuminated by roughly twenty thousand individual light bulbs, creating a sparkling effect.",
-    "Today, the tower endures as an enduring global symbol representing France and its cultural heritage.",
+    "The Eiffel Tower stands on the Champ de Mars in Paris.",
+    "Engineer Gustave Eiffel designed and built this famous landmark.",
+    "Construction of the tower's foundation began in January 1887.",
+    "The tower was completed and opened to the public in 1889.",
+    "It was built as the entrance for the 1889 World's Fair.",
+    "The tower rises to a height of about 330 meters.",
+    "It was the tallest man-made structure in the world until 1930.",
+    "The entire tower is built from strong, lightweight wrought iron.",
+    "The finished structure weighs roughly ten thousand one hundred tons.",
+    "Visitors can explore the tower across three public levels.",
+    "Around seven million people visit the tower every year.",
+    "It is one of the most recognizable landmarks in the world.",
+    "The tower is repainted with fresh coats roughly every seven years.",
+    "Each repainting uses about sixty tons of specially made paint.",
+    "In strong winds, the top of the tower can sway slightly.",
+    "The tower was originally meant to be a temporary structure.",
+    "The iron framework is often described as having 108 stories.",
+    "The tower base forms a square about 125 meters per side.",
+    "At night, twenty thousand light bulbs illuminate the tower.",
+    "The tower remains a lasting global symbol of France today.",
 ]
 
 # Genuine paraphrases of BASE_FACTS, same order, same meaning, deliberately
 # different wording and sentence structure -- this is the "semantic overlap"
 # content used to build chunk B, never a copy of BASE_FACTS.
 PARAPHRASED_FACTS = [
-    "Standing tall in the heart of Paris on the Champ de Mars, the Eiffel Tower is a well-known lattice-work iron landmark.",
-    "The landmark's design and construction were carried out by the French engineering firm led by Gustave Eiffel.",
-    "Building work on the tower's base and metal frame began at the start of 1887, after extensive preparation.",
-    "It took over two years to build, and the tower opened to the public in March of 1889.",
-    "Originally, the tower served as a grand gateway for visitors attending the World's Fair hosted in Paris in 1889.",
-    "Reaching roughly 330 meters into the sky, the tower represented a remarkable feat of engineering at the time.",
-    "The tower remained the world's tallest man-made structure for more than 40 years, losing that title only in 1930.",
-    "Wrought iron, valued for being both sturdy and comparatively light, was used throughout the tower's entire framework.",
-    "Not counting smaller add-ons, the completed tower has a total weight of around 10,100 metric tons.",
-    "The tower offers three separate levels open to the public, each providing a unique vantage point over Paris.",
-    "About seven million tourists travel to see the tower annually, making it one of the world's top attractions.",
-    "Few structures anywhere are as instantly identifiable as this landmark, which is famous the world over.",
-    "Roughly every seven years, workers repaint the entire tower to keep it from rusting.",
-    "Each repainting job uses close to sixty tons of paint, applied entirely by hand.",
-    "When winds are strong, the tower's upper portion has been known to sway noticeably from one side to the other.",
-    "Originally, engineers planned for the tower to stand for only two decades before being taken down.",
-    "Architecturally speaking, the tower's iron structure is often said to contain 108 individual stories.",
-    "The tower's foundation forms a square shape, with each side stretching about 125 meters.",
-    "At night, around twenty thousand light bulbs illuminate the tower, giving it a shimmering appearance.",
-    "The tower continues to stand today as a lasting emblem of French culture and identity.",
+    "Located on the Champ de Mars, the tower rises above central Paris.",
+    "The famous landmark was designed and built by Gustave Eiffel's firm.",
+    "Work on the tower's base and framework started in early 1887.",
+    "After construction, the tower opened its doors to visitors in 1889.",
+    "The tower first served as the entrance to the 1889 World's Fair.",
+    "Standing roughly 330 meters tall, the tower is an engineering marvel.",
+    "For more than 40 years, it was the world's tallest man-made structure.",
+    "Sturdy yet fairly light wrought iron forms the tower's entire frame.",
+    "Not including extras, the tower weighs close to 10,100 metric tons.",
+    "Three distinct levels let visitors take in different views of Paris.",
+    "About seven million tourists come to see the tower each year.",
+    "Hardly any landmark is as instantly recognizable as this one.",
+    "Workers repaint the tower roughly every seven years to prevent rust.",
+    "Around sixty tons of paint go into each full repainting job.",
+    "Strong winds can cause the tower's upper section to sway a bit.",
+    "Engineers originally planned to take the tower down after twenty years.",
+    "The tower's frame is often said to contain 108 individual stories.",
+    "The base of the tower forms a square roughly 125 meters wide.",
+    "Around twenty thousand bulbs light up the tower after sunset.",
+    "Today, the tower still stands as an enduring symbol of France.",
 ]
 
 # Unrelated sentences used to replace PARAPHRASED_FACTS sentences in chunk B
 # as the target overlap decreases, keeping chunk length roughly constant so
 # overlap percentage is not confounded with chunk length.
 DISTRACTOR_FACTS = [
-    "The Amazon rainforest stretches across a vast portion of northwestern Brazil, forming one of the planet's largest ecosystems.",
-    "Beyond Brazil, the forest also extends into neighboring countries including Peru, Colombia, and several other South American nations.",
-    "In total, the rainforest covers an area of roughly 5.5 million square kilometers of dense tropical vegetation.",
-    "It is widely recognized as the largest tropical rainforest anywhere on Earth, unmatched in scale.",
-    "The mighty Amazon River winds its way through the heart of the forest, feeding countless tributaries along the way.",
-    "By volume, the Amazon River discharges more freshwater into the ocean than any other river system on the planet.",
-    "Millions of distinct plant, animal, and insect species make their home within the boundaries of this rainforest.",
-    "Scientists estimate the forest contains roughly ten percent of all species currently known to science.",
-    "Numerous indigenous communities have lived within the rainforest for generations, relying on it for their way of life.",
-    "The forest plays an outsized role in regulating weather patterns and climate conditions across the globe.",
-    "Through photosynthesis, the rainforest is responsible for producing close to twenty percent of the world's oxygen supply.",
-    "Each year, significant portions of the rainforest are lost to deforestation driven by human activity.",
-    "The primary drivers behind this forest loss are commercial logging operations and large-scale agricultural expansion.",
-    "In some areas, the forest canopy rises to heights exceeding forty meters above the ground.",
-    "Certain regions of the rainforest receive more than two thousand millimeters of rainfall over the course of a year.",
-    "The forest is also an important habitat for thousands of distinct bird species found nowhere else.",
-    "Iconic animals such as jaguars, sloths, and river dolphins all make their home within this ecosystem.",
-    "Researchers continue to identify previously unknown species living within the depths of the rainforest.",
-    "Numerous conservation initiatives have been launched in an effort to preserve what remains of the forest.",
-    "Because of its role in producing oxygen, the Amazon is frequently referred to as the lungs of the planet.",
+    "The Amazon rainforest covers a huge area of northwestern Brazil.",
+    "The forest also stretches into Peru, Colombia, and nearby countries.",
+    "In total, it spans roughly 5.5 million square kilometers of land.",
+    "It is recognized as the largest tropical rainforest on Earth.",
+    "The Amazon River flows directly through the heart of the forest.",
+    "This river discharges more water than any other river worldwide.",
+    "Millions of plant, animal, and insect species live in this forest.",
+    "The forest holds about ten percent of all known species.",
+    "Many indigenous communities have lived in the forest for generations.",
+    "The rainforest plays a major role in regulating the global climate.",
+    "It produces close to twenty percent of the world's oxygen supply.",
+    "Large areas of the forest are lost to deforestation every year.",
+    "Logging and farming are the main causes of this forest loss.",
+    "In places, the forest canopy rises higher than forty meters.",
+    "Some regions get more than two thousand millimeters of rain yearly.",
+    "The forest is home to thousands of different bird species.",
+    "Jaguars, sloths, and river dolphins all live within this ecosystem.",
+    "Scientists keep discovering new species deep within the rainforest.",
+    "Conservation groups are working hard to protect the remaining forest.",
+    "The Amazon is often called the lungs of our planet.",
 ]
 
 assert len(BASE_FACTS) == len(PARAPHRASED_FACTS) == len(DISTRACTOR_FACTS) == 20, \
@@ -159,7 +176,26 @@ cross_encoder.eval()
 
 print(f"Loading bi-encoder: {EMBED_MODEL} on {DEVICE} ...")
 bi_encoder = SentenceTransformer(EMBED_MODEL, device=DEVICE)
+bi_encoder.max_seq_length = MAX_LENGTH
 print("Models loaded.\n")
+
+
+def _check_no_truncation(chunk_a: str, chunk_b: str, overlap_pct: int) -> None:
+    """
+    Warn loudly if MAX_LENGTH is too small for this pair, instead of
+    letting the tokenizer silently drop the tail of chunk_b -- exactly the
+    bug that made an earlier version of this script report an identical
+    NIS and cosine_sim across most overlap levels (the differentiating
+    content near the end of chunk_b never reached the model).
+    """
+    true_len = len(tokenizer(chunk_a, chunk_b, truncation=False)["input_ids"])
+    if true_len > MAX_LENGTH:
+        print(
+            f"  [WARNING] overlap={overlap_pct}%: pair is {true_len} tokens, "
+            f"exceeds MAX_LENGTH={MAX_LENGTH}. The tail of chunk_b will be "
+            f"truncated away -- results at this overlap level cannot be "
+            f"trusted. Shorten the fact sentences or raise MAX_LENGTH."
+        )
 
 
 # ── Scoring functions ────────────────────────────────────────────────────────
@@ -177,7 +213,7 @@ def compute_nis(chunk_a: str, chunk_b: str) -> dict:
     """
     inputs = tokenizer(
         chunk_a, chunk_b,
-        return_tensors="pt", truncation=True, max_length=256, padding=True,
+        return_tensors="pt", truncation=True, max_length=MAX_LENGTH, padding=True,
     ).to(DEVICE)
 
     outputs = cross_encoder(**inputs)
@@ -238,6 +274,7 @@ def main():
     rows = []
     for overlap_pct in OVERLAP_LEVELS:
         chunk_a, chunk_b = build_pair(overlap_pct)
+        _check_no_truncation(chunk_a, chunk_b, overlap_pct)
         cos_sim = compute_cosine_similarity(chunk_a, chunk_b)
         cacd    = compute_nis(chunk_a, chunk_b)
 
