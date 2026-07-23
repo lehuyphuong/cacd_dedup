@@ -1,5 +1,5 @@
 """
-scripts/experiment_probdup_vs_similarity.py
+scripts/experiment_prob_vs_similarity.py
 
 Standalone experiment: compares prob_dup (CACD's cross-encoder duplicate
 probability, from its classification head) against cosine similarity (the
@@ -67,7 +67,7 @@ No dependency on the benchmark pipeline -- only requires:
   pip install transformers sentence-transformers torch numpy scipy
 
 Run from the project root:
-  python scripts/experiment_probdup_vs_similarity.py
+  python scripts/experiment_prob_vs_similarity.py
 """
 
 from __future__ import annotations
@@ -433,16 +433,12 @@ def run_topic_pair(topic: dict) -> list[dict]:
 
 
 def print_summary_table(rows: list[dict]) -> None:
-    header = f"{'Overlap %':>10} | {'Cosine':>7} | {'Sim>=.8?':>9} | {'prob_dup':>9} | {'CACD Zone1?':>12}"
+    header = f"{'Overlap %':>10} | {'Cosine':>7} | {'prob_dup':>9}"
     print(header)
     print("-" * len(header))
     for r in rows:
-        sim_flag = "DUP" if r["cosine_sim"] >= SIMILARITY_THRESHOLD else "keep"
-        pd_flag  = "DUP" if r["prob_dup"] >= PROB_HIGH else "keep"
-        print(
-            f"{r['overlap_pct']:>9}% | {r['cosine_sim']:>7.4f} | {sim_flag:>9} | "
-            f"{r['prob_dup']:>9.4f} | {pd_flag:>12}"
-        )
+        print(f"{r['overlap_pct']:>9}% | {r['cosine_sim']:>7.4f} | {r['prob_dup']:>9.4f}")
+
 
 
 def correlations(rows: list[dict]) -> dict:
