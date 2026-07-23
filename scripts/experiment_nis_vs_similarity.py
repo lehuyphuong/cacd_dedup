@@ -1,10 +1,30 @@
 """
 scripts/experiment_nis_vs_similarity.py
 
-Standalone experiment: compares CACD's New Information Score (NIS) against
-plain cosine similarity (the Similarity baseline's signal) across a
-controlled gradient of SEMANTIC overlap, from 100% down to 0% in 10% steps,
-repeated across several independent topic pairs and averaged.
+Standalone experiment: compares signals derived from CACD's actual
+cross-encoder (cross-encoder/msmarco-MiniLM-L6-en-de-v1) against plain
+cosine similarity (the Similarity baseline's signal), across a controlled
+gradient of SEMANTIC overlap and a hard-negative test.
+
+This version compares three cross-encoder-derived signals, all from the
+same single forward pass, rather than just the last-layer NIS used in
+CACD today:
+  - nis        : CACD's current definition. Entropy of the B=>A attention
+                 from the LAST transformer layer, normalized by log|A|.
+  - nis_mid    : the same entropy computation, but read from a MIDDLE
+                 transformer layer instead of the last one. Prior work on
+                 BERT-family models suggests middle layers tend to carry
+                 more semantic/coreference information, while later
+                 layers specialize toward the model's fine-tuning
+                 objective (here, MS MARCO relevance ranking) -- this
+                 tests whether that specialization is why last-layer NIS
+                 struggled to tell genuine paraphrases from same-style,
+                 different-entity text in an earlier hard-negative test.
+  - redundancy_signal : max-alignment coverage (BERTScore-style), already
+                 computed in CACD's production code
+                 (src/dedup/stage2_cross_attention.py) but not currently
+                 used by the decision rule. min(coverage_a_to_b,
+                 coverage_b_to_a) from the last layer.
 
 Why semantic overlap, not verbatim overlap: the central claim this paper
 makes about pooled-vector similarity is that it can be misled once wording
@@ -17,9 +37,9 @@ wording at all, only meaning.
 Why several topic pairs, not one: a single hand-built example (e.g. Eiffel
 Tower vs. Amazon rainforest) is an anecdote, not evidence -- a pattern seen
 on one topic pair could easily be specific to that pair's vocabulary rather
-than a general property of NIS or cosine similarity. TOPIC_PAIRS below
-holds several independent (base, paraphrase, distractor) triples; results
-are reported per pair and averaged across pairs.
+than a general property of any signal here. TOPIC_PAIRS below holds several
+independent (base, paraphrase, distractor) triples; results are reported
+per pair and averaged across pairs.
 
 How overlap is controlled: chunk A is always the same base passage for a
 given topic pair. Chunk B keeps a paraphrase (never a copy) of overlap_pct
@@ -27,27 +47,27 @@ percent of chunk A's sentences and replaces the rest with sentences from
 an unrelated passage. WHICH sentences are replaced follows a fixed,
 reproducible scatter order rather than always cutting off the tail, so
 the replaced sentences are spread throughout chunk B instead of
-concentrated in one contiguous block -- this was changed after an earlier
-block-concatenation design showed prob_dup staying flat across most of
-the gradient and then dropping abruptly near 0% overlap, rather than
-declining gradually; scattering removes the single sharp "topic breaks
-here" point a block design creates, so it isolates whether that
-abruptness came from the block structure or is a property of the
-classifier itself. See _removal_order and build_pair for details.
+concentrated in one contiguous block. See _removal_order and build_pair.
+
+HARD_NEGATIVE_PAIRS tests a different, arguably more important failure
+mode: two complete, independent passages about two DIFFERENT real things,
+written with matching sentence templates, so they share surface style and
+structure but are not duplicates at all. A good redundancy signal should
+score these low.
 
 Sentence and chunk length: kept short (~7-8 words per sentence, whole
 chunk under ~300 characters) for two independent reasons found while
 developing this script:
-  1. Two earlier, longer-sentence versions silently exceeded the
-     tokenizer's MAX_LENGTH, truncating away the differentiating content
-     near the end of chunk_b for most overlap levels. This script asserts
-     at runtime that no truncation occurs (see _check_no_truncation).
+  1. Longer-sentence versions silently exceeded the tokenizer's
+     MAX_LENGTH, truncating away the differentiating content near the
+     end of chunk_b for most overlap levels. This script asserts at
+     runtime that no truncation occurs (see _check_no_truncation).
   2. Chunks longer than CACD's real LENGTH_GUARD (300 characters) are
      protected from being dropped whenever NIS > NIS_FLOOR (0.3) in the
-     actual pipeline, which would make the length guard -- not NIS or
-     cosine_sim -- the thing deciding the outcome. This script also
-     asserts at runtime that no chunk exceeds LENGTH_GUARD (see
-     _check_length_guard).
+     actual pipeline, which would make the length guard -- not any
+     cross-encoder signal or cosine_sim -- the thing deciding the
+     outcome. This script also asserts at runtime that no chunk exceeds
+     LENGTH_GUARD (see _check_length_guard).
 Do not trust any result printed alongside either warning.
 
 No dependency on the benchmark pipeline -- only requires:
@@ -68,22 +88,13 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 # ── Config ────────────────────────────────────────────────────────────────────
 
 CROSS_ENCODER_MODEL = "cross-encoder/msmarco-MiniLM-L6-en-de-v1"
-
-# Second cross-encoder, trained on STS-Benchmark (continuous 0-5 similarity
-# labels) rather than MS MARCO passage-relevance ranking (mostly binary
-# relevant/not-relevant). Added to test whether the "confident, then a
-# sudden cliff" behavior seen from CACD's cross-encoder is a property of
-# cross-encoders in general, or specific to a model trained for ranking
-# rather than graded similarity.
-CROSS_ENCODER_MODEL_ALT = "cross-encoder/stsb-roberta-base"
-
 EMBED_MODEL         = "sentence-transformers/all-MiniLM-L6-v2"
 DEVICE               = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Max sequence length for both the cross-encoder pair and the bi-encoder.
-# 512 is the hard architectural ceiling for both models here (standard
-# BERT-family position embeddings) -- it cannot be raised further; the
-# fix for exceeding it is to shorten the input text, not raise this value.
+# Max sequence length for the cross-encoder pair and the bi-encoder. 512 is
+# the hard architectural ceiling for both models here (standard BERT-family
+# position embeddings) -- it cannot be raised further; the fix for
+# exceeding it is to shorten the input text, not raise this value.
 MAX_LENGTH = 512
 
 # Overlap levels to test per topic pair: 100%, 90%, ..., 0% (11 levels,
@@ -353,7 +364,6 @@ def _load_cross_encoder(model_name: str):
 
 
 tokenizer, cross_encoder = _load_cross_encoder(CROSS_ENCODER_MODEL)
-tokenizer_alt, cross_encoder_alt = _load_cross_encoder(CROSS_ENCODER_MODEL_ALT)
 
 print(f"Loading bi-encoder: {EMBED_MODEL} on {DEVICE} ...")
 bi_encoder = SentenceTransformer(EMBED_MODEL, device=DEVICE)
@@ -400,19 +410,59 @@ def _check_length_guard(chunk_a: str, chunk_b: str, topic_name: str, overlap_pct
 
 # ── Scoring functions ────────────────────────────────────────────────────────
 
+def _entropy_nis(attn: torch.Tensor, a_range: slice, b_range: slice, len_a: int) -> float:
+    """
+    New Information Score from one layer's attention matrix (heads already
+    averaged): entropy of the B=>A attention, normalized by log|A|,
+    averaged over tokens of B. Shared by both the last-layer (CACD's
+    current definition) and middle-layer computations below, so the two
+    are computed identically except for which layer's attention is used.
+    """
+    sub_b2a = attn[b_range, a_range]
+    if sub_b2a.numel() == 0 or len_a < 2:
+        return 1.0
+    row_sums = sub_b2a.sum(dim=1, keepdim=True).clamp(min=1e-9)
+    p_b2a    = sub_b2a / row_sums
+    ent      = -(p_b2a * torch.log(p_b2a + 1e-9)).sum(dim=1)
+    max_ent  = float(np.log(len_a))
+    if max_ent <= 1e-9:
+        return 1.0
+    return float((ent / max_ent).mean().clamp(0.0, 1.0).item())
+
+
+def _max_alignment_coverage(attn: torch.Tensor, a_range: slice, b_range: slice) -> tuple[float, float]:
+    """
+    Max-alignment coverage (BERTScore-style), exactly as implemented in
+    CACD's production code (src/dedup/stage2_cross_attention.py's
+    _max_alignment_coverage) but not currently read by the decision rule.
+    coverage_a_to_b: for each token of A, its single strongest attention
+    weight toward any token of B, averaged over A's tokens (and the
+    reverse for coverage_b_to_a).
+    """
+    sub_a2b = attn[a_range, b_range]
+    sub_b2a = attn[b_range, a_range]
+    if sub_a2b.numel() == 0 or sub_b2a.numel() == 0:
+        return 0.0, 0.0
+    cov_a2b = sub_a2b.max(dim=1).values.mean().item()
+    cov_b2a = sub_b2a.max(dim=1).values.mean().item()
+    return cov_a2b, cov_b2a
+
+
 def compute_nis(tok, model, chunk_a: str, chunk_b: str) -> dict:
     """
-    Score (chunk_a, chunk_b) with the given cross-encoder and compute the
-    New Information Score exactly as defined in CACD: entropy of the B=>A
-    attention (how much of chunk_b's tokens are explained by chunk_a),
-    normalized by log|A|, averaged over the tokens of chunk_b.
+    Score (chunk_a, chunk_b) with the cross-encoder in a single forward
+    pass, and compute three signals from the resulting attentions:
 
-    Works with any BERT-family sequence-classification cross-encoder that
-    returns attentions, not just CACD_CROSS_ENCODER_MODEL -- used here to
-    compare CACD's actual cross-encoder against an STS-trained alternative.
+      nis               : CACD's current definition -- entropy-based NIS
+                           from the LAST transformer layer.
+      nis_mid           : the same entropy-based NIS, but from a MIDDLE
+                           transformer layer instead.
+      redundancy_signal : max-alignment coverage from the LAST layer,
+                           min(coverage_a_to_b, coverage_b_to_a) -- already
+                           computed in CACD's production code but not
+                           currently used by the decision rule.
 
-    Returns dict with prob_dup (cross-encoder duplicate probability) and
-    nis (New Information Score, in [0, 1]).
+    Also returns prob_dup, the cross-encoder's own duplicate probability.
     """
     inputs = tok(
         chunk_a, chunk_b,
@@ -428,8 +478,11 @@ def compute_nis(tok, model, chunk_a: str, chunk_b: str) -> dict:
         else float(torch.softmax(logits, dim=-1)[-1].item())
     )
 
-    last_attn = outputs.attentions[-1][0]      # (num_heads, seq, seq)
-    avg_attn  = last_attn.mean(dim=0)          # (seq, seq)
+    all_layers = outputs.attentions              # tuple of (1, num_heads, seq, seq), one per layer
+    n_layers   = len(all_layers)
+    last_attn  = all_layers[-1][0].mean(dim=0)    # (seq, seq), heads averaged
+    mid_idx    = n_layers // 2
+    mid_attn   = all_layers[mid_idx][0].mean(dim=0)
 
     input_ids = inputs["input_ids"][0]
     n_tokens  = int(inputs["attention_mask"][0].sum().item())
@@ -438,12 +491,11 @@ def compute_nis(tok, model, chunk_a: str, chunk_b: str) -> dict:
 
     if len(sep_pos) > 0:
         first_sep = int(sep_pos[0].item())
-        # Some tokenizers (e.g. RoBERTa: "<s> A </s></s> B </s>") place two
-        # consecutive separator tokens between segments, not one (BERT:
-        # "[CLS] A [SEP] B [SEP]"). Skip over any run of consecutive sep
-        # tokens so b_start lands on the first real token of B in either
-        # convention, instead of silently treating a second separator as
-        # part of B.
+        # Some tokenizers place two consecutive separator tokens between
+        # segments (RoBERTa-style "</s></s>") rather than one (BERT-style
+        # "[SEP]"); skip any run of consecutive sep tokens so b_start lands
+        # on the first real token of B either way. CACD's own tokenizer
+        # uses the single-separator convention, but this stays defensive.
         b_start = first_sep + 1
         while b_start < n_tokens and int(input_ids[b_start].item()) == sep_id:
             b_start += 1
@@ -455,21 +507,22 @@ def compute_nis(tok, model, chunk_a: str, chunk_b: str) -> dict:
     len_a   = sep_idx - 1
     a_range = slice(1, sep_idx)
     b_range = slice(b_start, n_tokens - 1)
-    sub_b2a = avg_attn[b_range, a_range]       # tokens of B attending to A
 
-    if sub_b2a.numel() == 0 or len_a < 2:
-        nis = 1.0
-    else:
-        row_sums = sub_b2a.sum(dim=1, keepdim=True).clamp(min=1e-9)
-        p_b2a    = sub_b2a / row_sums
-        ent      = -(p_b2a * torch.log(p_b2a + 1e-9)).sum(dim=1)
-        max_ent  = float(np.log(len_a))
-        nis = (
-            float((ent / max_ent).mean().clamp(0.0, 1.0).item())
-            if max_ent > 1e-9 else 1.0
-        )
+    nis     = _entropy_nis(last_attn, a_range, b_range, len_a)
+    nis_mid = _entropy_nis(mid_attn, a_range, b_range, len_a)
+    cov_a2b, cov_b2a = _max_alignment_coverage(last_attn, a_range, b_range)
+    redundancy_signal = min(cov_a2b, cov_b2a)
 
-    return {"prob_dup": round(prob_dup, 4), "nis": round(nis, 4)}
+    return {
+        "prob_dup":          round(prob_dup, 4),
+        "nis":               round(nis, 4),
+        "nis_mid":           round(nis_mid, 4),
+        "mid_layer_index":   mid_idx,
+        "n_layers":          n_layers,
+        "coverage_a_to_b":   round(cov_a2b, 4),
+        "coverage_b_to_a":   round(cov_b2a, 4),
+        "redundancy_signal": round(redundancy_signal, 4),
+    }
 
 
 def compute_cosine_similarity(chunk_a: str, chunk_b: str) -> float:
@@ -483,32 +536,31 @@ def compute_cosine_similarity(chunk_a: str, chunk_b: str) -> float:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run_topic_pair(topic: dict) -> list[dict]:
-    """Run the full overlap gradient for one topic pair under both
-    cross-encoders, returning one result dict per overlap level."""
+    """Run the full overlap gradient for one topic pair, returning one
+    result dict per overlap level."""
     rows = []
     for overlap_pct in OVERLAP_LEVELS:
         chunk_a, chunk_b = build_pair(topic, overlap_pct)
         _check_no_truncation(tokenizer, chunk_a, chunk_b, topic["name"], overlap_pct, "msmarco")
-        _check_no_truncation(tokenizer_alt, chunk_a, chunk_b, topic["name"], overlap_pct, "stsb")
         _check_length_guard(chunk_a, chunk_b, topic["name"], overlap_pct)
 
-        cos_sim  = compute_cosine_similarity(chunk_a, chunk_b)
-        cacd     = compute_nis(tokenizer, cross_encoder, chunk_a, chunk_b)
-        cacd_alt = compute_nis(tokenizer_alt, cross_encoder_alt, chunk_a, chunk_b)
+        cos_sim = compute_cosine_similarity(chunk_a, chunk_b)
+        cacd    = compute_nis(tokenizer, cross_encoder, chunk_a, chunk_b)
 
         rows.append({
-            "overlap_pct": overlap_pct,
-            "cosine_sim":  round(cos_sim, 4),
-            "nis":         cacd["nis"],
-            "prob_dup":    cacd["prob_dup"],
-            "nis_alt":     cacd_alt["nis"],
-            "prob_dup_alt": cacd_alt["prob_dup"],
+            "overlap_pct":       overlap_pct,
+            "cosine_sim":        round(cos_sim, 4),
+            "nis":               cacd["nis"],
+            "nis_mid":           cacd["nis_mid"],
+            "prob_dup":          cacd["prob_dup"],
+            "redundancy_signal": cacd["redundancy_signal"],
         })
         print(
             f"  [{overlap_pct:3d}% overlap] "
-            f"cosine_sim={cos_sim:.4f}  "
-            f"msmarco(NIS={cacd['nis']:.4f}, p_dup={cacd['prob_dup']:.4f})  "
-            f"stsb(NIS={cacd_alt['nis']:.4f}, p_dup={cacd_alt['prob_dup']:.4f})"
+            f"cosine_sim={cos_sim:.4f}  NIS(last)={cacd['nis']:.4f}  "
+            f"NIS(mid,L{cacd['mid_layer_index']})={cacd['nis_mid']:.4f}  "
+            f"redundancy={cacd['redundancy_signal']:.4f}  "
+            f"prob_dup={cacd['prob_dup']:.4f}"
         )
     return rows
 
@@ -516,9 +568,8 @@ def run_topic_pair(topic: dict) -> list[dict]:
 def run_hard_negative_test() -> list[dict]:
     """
     Score each hard-negative pair with cosine similarity and with CACD's
-    actual cross-encoder (NIS and prob_dup). Only the msmarco model is used
-    here, since this result is meant to describe CACD as it actually is,
-    not an alternative model.
+    actual cross-encoder (NIS from the last and a middle layer, prob_dup,
+    and the unused-in-production redundancy_signal).
     """
     rows = []
     for pair in HARD_NEGATIVE_PAIRS:
@@ -530,16 +581,20 @@ def run_hard_negative_test() -> list[dict]:
         cacd    = compute_nis(tokenizer, cross_encoder, chunk_a, chunk_b)
 
         rows.append({
-            "name":       pair["name"],
-            "cosine_sim": round(cos_sim, 4),
-            "nis":        cacd["nis"],
-            "prob_dup":   cacd["prob_dup"],
+            "name":              pair["name"],
+            "cosine_sim":        round(cos_sim, 4),
+            "nis":               cacd["nis"],
+            "nis_mid":           cacd["nis_mid"],
+            "prob_dup":          cacd["prob_dup"],
+            "redundancy_signal": cacd["redundancy_signal"],
         })
         print(f"  {pair['name']}")
         print(
             f"    cosine_sim={cos_sim:.4f} "
             f"({'DUP' if cos_sim >= SIMILARITY_THRESHOLD else 'keep'})  "
-            f"NIS={cacd['nis']:.4f}  prob_dup={cacd['prob_dup']:.4f} "
+            f"NIS(last)={cacd['nis']:.4f}  NIS(mid,L{cacd['mid_layer_index']})={cacd['nis_mid']:.4f}  "
+            f"redundancy={cacd['redundancy_signal']:.4f}  "
+            f"prob_dup={cacd['prob_dup']:.4f} "
             f"({'DUP' if cacd['prob_dup'] >= SIMILARITY_THRESHOLD else 'keep'})"
         )
     return rows
@@ -548,7 +603,7 @@ def run_hard_negative_test() -> list[dict]:
 def print_summary_table(rows: list[dict]) -> None:
     header = (
         f"{'Overlap %':>10} | {'Cosine':>7} | {'Sim>=.8?':>9} | "
-        f"{'NIS(mm)':>8} | {'pdup(mm)':>9} | {'NIS(sts)':>9} | {'pdup(sts)':>10}"
+        f"{'NIS(last)':>9} | {'NIS(mid)':>9} | {'redund.':>8} | {'p_dup':>7}"
     )
     print(header)
     print("-" * len(header))
@@ -556,8 +611,8 @@ def print_summary_table(rows: list[dict]) -> None:
         sim_flag = "DUP" if r["cosine_sim"] >= SIMILARITY_THRESHOLD else "keep"
         print(
             f"{r['overlap_pct']:>9}% | {r['cosine_sim']:>7.4f} | "
-            f"{sim_flag:>9} | {r['nis']:>8.4f} | {r['prob_dup']:>9.4f} | "
-            f"{r['nis_alt']:>9.4f} | {r['prob_dup_alt']:>10.4f}"
+            f"{sim_flag:>9} | {r['nis']:>9.4f} | {r['nis_mid']:>9.4f} | "
+            f"{r['redundancy_signal']:>8.4f} | {r['prob_dup']:>7.4f}"
         )
 
 
@@ -567,16 +622,15 @@ def correlations(rows: list[dict]) -> dict:
     signal can rank pairs correctly (high rho) while still being highly
     non-linear in its raw values (lower r), or vice versa.
 
-    Includes prob_dup for both cross-encoders (not just NIS), since the
-    central question at this point is whether prob_dup's "confident, then
-    a sudden cliff" behavior is specific to CACD's MS MARCO-trained
-    cross-encoder or general to cross-encoders repurposed this way."""
-    overlaps          = np.array([r["overlap_pct"] for r in rows], dtype=float)
-    cos_vals          = np.array([r["cosine_sim"] for r in rows])
-    one_minus_nis     = 1.0 - np.array([r["nis"] for r in rows])
-    one_minus_nis_alt = 1.0 - np.array([r["nis_alt"] for r in rows])
-    prob_dup          = np.array([r["prob_dup"] for r in rows])
-    prob_dup_alt      = np.array([r["prob_dup_alt"] for r in rows])
+    cosine_sim and redundancy_signal both read as "higher = more alike",
+    so they are correlated directly. nis and nis_mid read as "higher =
+    more novel", so 1 - x is used to put them on the same direction before
+    correlating."""
+    overlaps           = np.array([r["overlap_pct"] for r in rows], dtype=float)
+    cos_vals           = np.array([r["cosine_sim"] for r in rows])
+    one_minus_nis      = 1.0 - np.array([r["nis"] for r in rows])
+    one_minus_nis_mid  = 1.0 - np.array([r["nis_mid"] for r in rows])
+    redundancy         = np.array([r["redundancy_signal"] for r in rows])
 
     def _both(vals):
         r_, _   = pearsonr(overlaps, vals)
@@ -585,26 +639,24 @@ def correlations(rows: list[dict]) -> dict:
 
     r_cos, rho_cos     = _both(cos_vals)
     r_nis, rho_nis     = _both(one_minus_nis)
-    r_nis_a, rho_nis_a = _both(one_minus_nis_alt)
-    r_pd, rho_pd       = _both(prob_dup)
-    r_pd_a, rho_pd_a   = _both(prob_dup_alt)
+    r_nism, rho_nism   = _both(one_minus_nis_mid)
+    r_red, rho_red     = _both(redundancy)
 
     return {
         "pearson_cosine": r_cos, "spearman_cosine": rho_cos,
         "pearson_nis": r_nis, "spearman_nis": rho_nis,
-        "pearson_nis_alt": r_nis_a, "spearman_nis_alt": rho_nis_a,
-        "pearson_probdup": r_pd, "spearman_probdup": rho_pd,
-        "pearson_probdup_alt": r_pd_a, "spearman_probdup_alt": rho_pd_a,
+        "pearson_nis_mid": r_nism, "spearman_nis_mid": rho_nism,
+        "pearson_redundancy": r_red, "spearman_redundancy": rho_red,
     }
 
 
 def main():
     print("=" * 92)
-    print("NIS vs. Cosine Similarity across a controlled semantic-overlap gradient")
-    print(f"Cross-encoder (CACD):     {CROSS_ENCODER_MODEL}")
-    print(f"Cross-encoder (STS, alt): {CROSS_ENCODER_MODEL_ALT}")
-    print(f"Bi-encoder:               {EMBED_MODEL}")
-    print(f"Topic pairs:              {len(TOPIC_PAIRS)}")
+    print("Cross-encoder signals vs. Cosine Similarity: last-layer NIS, a middle-layer")
+    print("variant, and max-alignment coverage, across a semantic-overlap gradient")
+    print(f"Cross-encoder (CACD): {CROSS_ENCODER_MODEL}")
+    print(f"Bi-encoder:           {EMBED_MODEL}")
+    print(f"Topic pairs:          {len(TOPIC_PAIRS)}")
     print("=" * 92)
 
     all_corrs = []
@@ -624,11 +676,11 @@ def main():
         all_corrs.append(corr)
         print()
         print(f"  Pearson r    -- cosine: {corr['pearson_cosine']:.4f} | "
-              f"(1-NIS) mm: {corr['pearson_nis']:.4f} | (1-NIS) sts: {corr['pearson_nis_alt']:.4f} | "
-              f"p_dup mm: {corr['pearson_probdup']:.4f} | p_dup sts: {corr['pearson_probdup_alt']:.4f}")
+              f"(1-NIS) last: {corr['pearson_nis']:.4f} | (1-NIS) mid: {corr['pearson_nis_mid']:.4f} | "
+              f"redundancy: {corr['pearson_redundancy']:.4f}")
         print(f"  Spearman rho -- cosine: {corr['spearman_cosine']:.4f} | "
-              f"(1-NIS) mm: {corr['spearman_nis']:.4f} | (1-NIS) sts: {corr['spearman_nis_alt']:.4f} | "
-              f"p_dup mm: {corr['spearman_probdup']:.4f} | p_dup sts: {corr['spearman_probdup_alt']:.4f}")
+              f"(1-NIS) last: {corr['spearman_nis']:.4f} | (1-NIS) mid: {corr['spearman_nis_mid']:.4f} | "
+              f"redundancy: {corr['spearman_redundancy']:.4f}")
 
     # ── Averaged across all topic pairs ─────────────────────────────────────
     print()
@@ -636,30 +688,27 @@ def main():
     print(f"AVERAGED ACROSS {len(TOPIC_PAIRS)} TOPIC PAIRS")
     print("=" * 92)
     keys = [
-        "pearson_cosine", "pearson_nis", "pearson_nis_alt", "pearson_probdup", "pearson_probdup_alt",
-        "spearman_cosine", "spearman_nis", "spearman_nis_alt", "spearman_probdup", "spearman_probdup_alt",
+        "pearson_cosine", "pearson_nis", "pearson_nis_mid", "pearson_redundancy",
+        "spearman_cosine", "spearman_nis", "spearman_nis_mid", "spearman_redundancy",
     ]
     for key in keys:
         vals = [c[key] for c in all_corrs]
         mean = np.mean(vals)
         spread = f"(individual: {', '.join(f'{v:.4f}' for v in vals)})"
-        print(f"  {key:<22}: mean = {mean:.4f}  {spread}")
+        print(f"  {key:<20}: mean = {mean:.4f}  {spread}")
 
     print()
     print("Interpretation:")
-    print("  'mm' = CACD's actual cross-encoder (trained on MS MARCO passage")
-    print("  ranking, mostly binary relevant/not-relevant); 'sts' = an")
-    print("  alternative cross-encoder trained on STS-Benchmark (continuous")
-    print("  0-5 similarity labels). If p_dup(sts) correlates with true")
-    print("  overlap noticeably better than p_dup(mm), that points to the")
-    print("  training objective, not the cross-encoder architecture or CACD's")
-    print("  design, as the source of the earlier flat-then-cliff behavior --")
-    print("  a model trained for graded similarity should be better")
-    print("  calibrated across partial overlap than one trained mostly for")
-    print("  binary relevance ranking. If both still show the same cliff")
-    print("  pattern, that points more toward the paraphrase/distractor")
-    print("  sentence style itself, or the fact-list construction, rather")
-    print("  than the specific cross-encoder used.")
+    print("  'last' = CACD's current NIS definition (entropy from the final")
+    print("  transformer layer's attention). 'mid' = the same entropy")
+    print("  computation read from a middle layer instead, testing whether")
+    print("  the final layer's specialization toward MS MARCO relevance")
+    print("  ranking (rather than semantic alignment) explains NIS's")
+    print("  earlier difficulty telling genuine paraphrases from same-style,")
+    print("  different-entity text. 'redundancy' = max-alignment coverage,")
+    print("  already computed in CACD's production code but not currently")
+    print("  used by the decision rule -- included here as a second")
+    print("  candidate signal, not a replacement for NIS.")
     print("  With only two topic pairs, treat all averaged numbers as a")
     print("  first look, not a settled result.")
     print("  'Sim >= 0.8?' marks where the Similarity baseline's fixed")
@@ -685,7 +734,8 @@ def main():
         r100 = next(r for r in rows if r["overlap_pct"] == 100)
         print(
             f"  {topic['name']}: cosine_sim={r100['cosine_sim']:.4f}  "
-            f"NIS={r100['nis']:.4f}  prob_dup={r100['prob_dup']:.4f}"
+            f"NIS(last)={r100['nis']:.4f}  NIS(mid)={r100['nis_mid']:.4f}  "
+            f"redundancy={r100['redundancy_signal']:.4f}  prob_dup={r100['prob_dup']:.4f}"
         )
 
     print()
@@ -694,12 +744,12 @@ def main():
     print("  the genuine-duplicate reference point, that is the false-positive")
     print("  failure mode this paper motivates CACD with: two chunks that")
     print("  share surface style and structure, not real content, being")
-    print("  judged as near-duplicates. Whether NIS and prob_dup avoid that")
-    print("  same mistake here is the actual test of whether CACD's")
-    print("  cross-encoder step adds value beyond pooled similarity, not the")
-    print("  overlap-gradient result above. If NIS/prob_dup are fooled here")
-    print("  too, that is a genuine limitation to report, not a reason to")
-    print("  change the pairs.")
+    print("  judged as near-duplicates. Whether NIS(last), NIS(mid), and")
+    print("  redundancy_signal avoid that same mistake here is the actual")
+    print("  test of whether reading attention differently recovers a")
+    print("  meaningful signal for this failure mode. If all of them are")
+    print("  fooled here too, that is a genuine limitation to report, not a")
+    print("  reason to change the pairs.")
 
 
 if __name__ == "__main__":
