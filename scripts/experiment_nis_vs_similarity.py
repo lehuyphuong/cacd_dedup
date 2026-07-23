@@ -545,7 +545,7 @@ def run_hard_negative_test() -> list[dict]:
     return rows
 
 
-
+def print_summary_table(rows: list[dict]) -> None:
     header = (
         f"{'Overlap %':>10} | {'Cosine':>7} | {'Sim>=.8?':>9} | "
         f"{'NIS(mm)':>8} | {'pdup(mm)':>9} | {'NIS(sts)':>9} | {'pdup(sts)':>10}"
