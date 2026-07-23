@@ -201,6 +201,85 @@ for _tp in TOPIC_PAIRS:
         f"Topic pair '{_tp['name']}': base/paraphrase/distractor must be the same length."
 
 
+# ── Hard-negative pairs ──────────────────────────────────────────────────────
+#
+# TOPIC_PAIRS above tests a gradient of true overlap (same entity, decreasing
+# shared content). It does not test the specific failure mode this paper
+# motivates CACD with: two chunks that share surface style, structure, and
+# the kind of numbers used, but describe two different entities and are not
+# duplicates at all. Each pair below is two independent, fully-formed
+# passages about a different real thing, written with matching sentence
+# templates (same order of facts: location, builder, start date, ...). A
+# good redundancy signal should score these LOW; if cosine similarity scores
+# them high while NIS/p_dup do not, that specifically supports why CACD
+# compares more than pooled similarity. If NIS/p_dup are also fooled, that
+# is a real limitation worth reporting, not a reason to change the pairs.
+
+HARD_NEGATIVE_PAIRS = [
+    {
+        "name": "Eiffel Tower vs. Notre-Dame Cathedral (same city, different landmark)",
+        "chunk_a": [
+            "The tower is in Paris.",
+            "It was built by Eiffel.",
+            "Work began in 1887.",
+            "It opened in 1889.",
+            "It stands 330 meters tall.",
+            "It was tallest until 1930.",
+            "It is made of iron.",
+            "It weighs 10,000 tons.",
+            "Millions visit each year.",
+            "It symbolizes France.",
+        ],
+        "chunk_b": [
+            "The cathedral is in Paris.",
+            "It was built by medieval masons.",
+            "Work began in 1163.",
+            "It was finished in 1345.",
+            "It stands 96 meters tall.",
+            "It was Gothic in style.",
+            "It is made of stone.",
+            "It suffered a fire in 2019.",
+            "Millions visit each year.",
+            "It symbolizes French heritage.",
+        ],
+    },
+    {
+        "name": "Great Wall of China vs. Hadrian's Wall (same concept, different wall)",
+        "chunk_a": [
+            "The Great Wall is in China.",
+            "It was built to stop invasions.",
+            "Building began long ago.",
+            "Dynasties added new sections.",
+            "It spans thousands of kilometers.",
+            "Sections use stone and earth.",
+            "Watchtowers line the wall.",
+            "Millions of workers built it.",
+            "Tourists visit it yearly.",
+            "It symbolizes China.",
+        ],
+        "chunk_b": [
+            "Hadrian's Wall is in Britain.",
+            "It was built to mark a border.",
+            "Building began in 122 AD.",
+            "Romans manned the wall.",
+            "It spans about 120 kilometers.",
+            "Sections use stone and turf.",
+            "Forts line the wall.",
+            "Thousands of soldiers built it.",
+            "Tourists visit it yearly.",
+            "It symbolizes Roman Britain.",
+        ],
+    },
+]
+
+
+def build_hard_negative_pair(pair: dict) -> tuple[str, str]:
+    """Join a hard-negative pair's two independent passages into
+    (chunk_a, chunk_b), with no overlap-percentage construction involved --
+    both are fixed, complete passages about two different real things."""
+    return " ".join(pair["chunk_a"]), " ".join(pair["chunk_b"])
+
+
 def _removal_order(n_total: int, seed: int = 42) -> list[int]:
     """
     A fixed, reproducible random permutation of sentence positions, used to
@@ -434,7 +513,39 @@ def run_topic_pair(topic: dict) -> list[dict]:
     return rows
 
 
-def print_summary_table(rows: list[dict]) -> None:
+def run_hard_negative_test() -> list[dict]:
+    """
+    Score each hard-negative pair with cosine similarity and with CACD's
+    actual cross-encoder (NIS and prob_dup). Only the msmarco model is used
+    here, since this result is meant to describe CACD as it actually is,
+    not an alternative model.
+    """
+    rows = []
+    for pair in HARD_NEGATIVE_PAIRS:
+        chunk_a, chunk_b = build_hard_negative_pair(pair)
+        _check_no_truncation(tokenizer, chunk_a, chunk_b, pair["name"], -1, "msmarco")
+        _check_length_guard(chunk_a, chunk_b, pair["name"], -1)
+
+        cos_sim = compute_cosine_similarity(chunk_a, chunk_b)
+        cacd    = compute_nis(tokenizer, cross_encoder, chunk_a, chunk_b)
+
+        rows.append({
+            "name":       pair["name"],
+            "cosine_sim": round(cos_sim, 4),
+            "nis":        cacd["nis"],
+            "prob_dup":   cacd["prob_dup"],
+        })
+        print(f"  {pair['name']}")
+        print(
+            f"    cosine_sim={cos_sim:.4f} "
+            f"({'DUP' if cos_sim >= SIMILARITY_THRESHOLD else 'keep'})  "
+            f"NIS={cacd['nis']:.4f}  prob_dup={cacd['prob_dup']:.4f} "
+            f"({'DUP' if cacd['prob_dup'] >= SIMILARITY_THRESHOLD else 'keep'})"
+        )
+    return rows
+
+
+
     header = (
         f"{'Overlap %':>10} | {'Cosine':>7} | {'Sim>=.8?':>9} | "
         f"{'NIS(mm)':>8} | {'pdup(mm)':>9} | {'NIS(sts)':>9} | {'pdup(sts)':>10}"
@@ -497,12 +608,14 @@ def main():
     print("=" * 92)
 
     all_corrs = []
+    all_row_cache = []
     for topic in TOPIC_PAIRS:
         print()
         print("-" * 92)
         print(f"Topic pair: {topic['name']}")
         print("-" * 92)
         rows = run_topic_pair(topic)
+        all_row_cache.append(rows)
 
         print()
         print_summary_table(rows)
@@ -551,6 +664,42 @@ def main():
     print("  first look, not a settled result.")
     print("  'Sim >= 0.8?' marks where the Similarity baseline's fixed")
     print("  threshold would call the pair a duplicate at each overlap level.")
+
+    # ── Hard-negative test ───────────────────────────────────────────────────
+    print()
+    print("=" * 92)
+    print("HARD-NEGATIVE TEST: same style/structure, genuinely different entities")
+    print("=" * 92)
+    print("Each pair below is two complete, independent passages about two")
+    print("different real things, written with matching sentence templates.")
+    print("Neither is a duplicate of the other. Only CACD's actual")
+    print("cross-encoder (msmarco) is used here -- this result is meant to")
+    print("describe CACD as it actually is.")
+    print()
+    hn_rows = run_hard_negative_test()
+
+    print()
+    print("Reference point -- a genuine duplicate pair (100% overlap, from the")
+    print("gradient test above) for comparison:")
+    for topic, rows in zip(TOPIC_PAIRS, all_row_cache):
+        r100 = next(r for r in rows if r["overlap_pct"] == 100)
+        print(
+            f"  {topic['name']}: cosine_sim={r100['cosine_sim']:.4f}  "
+            f"NIS={r100['nis']:.4f}  prob_dup={r100['prob_dup']:.4f}"
+        )
+
+    print()
+    print("Interpretation:")
+    print("  If cosine_sim scores the hard-negative pairs nearly as high as")
+    print("  the genuine-duplicate reference point, that is the false-positive")
+    print("  failure mode this paper motivates CACD with: two chunks that")
+    print("  share surface style and structure, not real content, being")
+    print("  judged as near-duplicates. Whether NIS and prob_dup avoid that")
+    print("  same mistake here is the actual test of whether CACD's")
+    print("  cross-encoder step adds value beyond pooled similarity, not the")
+    print("  overlap-gradient result above. If NIS/prob_dup are fooled here")
+    print("  too, that is a genuine limitation to report, not a reason to")
+    print("  change the pairs.")
 
 
 if __name__ == "__main__":
